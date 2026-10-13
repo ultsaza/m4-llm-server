@@ -1,0 +1,1 @@
+Summarize the active task for continuation. Retain the user's requirements and constraints, files changed, verified results and failures, unresolved issues, and the next concrete action. Preserve essential paths and commands. Omit repeated output and secrets. Keep the summary short.

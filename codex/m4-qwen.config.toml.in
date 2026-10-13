@@ -1,0 +1,60 @@
+# Managed by the m4-qwen client installer. Base permissions are inherited.
+model = "macqwen-flashnext"
+model_provider = "m4_qwen"
+model_context_window = @CONTEXT@
+model_auto_compact_token_limit = @AUTO_COMPACT@
+model_reasoning_effort = "none"
+model_reasoning_summary = "none"
+web_search = "disabled"
+suppress_unstable_features_warning = true
+model_catalog_json = @CATALOG@
+model_instructions_file = @INSTRUCTIONS@
+experimental_compact_prompt_file = @COMPACT@
+
+[model_providers.m4_qwen]
+name = "m4 Qwen"
+base_url = @BASE_URL@
+wire_api = "responses"
+supports_websockets = false
+# Encrypted compaction sends its payload only after generation completes.
+# Allow the server's 1200-second deadline plus a minute for terminal delivery.
+stream_idle_timeout_ms = 1260000
+request_max_retries = 2
+stream_max_retries = 2
+
+[model_providers.m4_qwen.auth]
+command = "/bin/cat"
+args = [@KEY@]
+timeout_ms = 5000
+refresh_interval_ms = 0
+
+[model_providers.m4_qwen.capabilities]
+remote_compaction = @REMOTE_COMPACTION@
+
+[features]
+remote_compaction_v2 = true
+apps = false
+plugins = false
+remote_plugin = false
+plugin_sharing = false
+recommended_plugins = false
+memories = false
+multi_agent = false
+multi_agent_v2 = false
+goals = false
+browser_use = false
+browser_use_external = false
+browser_use_full_cdp_access = false
+browser_annotation_api = false
+in_app_browser = false
+computer_use = false
+in_app_local_automation = false
+image_generation = false
+view_image = false
+hooks = false
+code_mode = false
+code_mode_host = false
+skill_search = false
+skill_mcp_dependency_install = false
+skip_host_skill_discovery = true
+unified_exec = false

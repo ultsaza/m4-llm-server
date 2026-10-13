@@ -1,0 +1,50 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "macqwen-flashnext",
+      "object": "model",
+      "owned_by": "macqwen"
+    }
+  ],
+  "models": [
+    {
+      "slug": "macqwen-flashnext",
+      "display_name": "MACQWEN Flash-Next",
+      "description": "Local low-memory Qwen runtime",
+      "default_reasoning_level": "none",
+      "supported_reasoning_levels": [
+        {
+          "effort": "none",
+          "description": "Reasoning disabled"
+        }
+      ],
+      "supports_reasoning_summaries": false,
+      "input_modalities": [
+        "text"
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "minimal_client_version": [
+        0,
+        0,
+        0
+      ],
+      "supported_in_api": true,
+      "priority": 1,
+      "upgrade": null,
+      "base_instructions": "",
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": null,
+      "truncation_policy": {
+        "mode": "bytes",
+        "limit": 100000
+      },
+      "supports_parallel_tool_calls": false,
+      "supports_image_detail_original": false,
+      "context_window": 4096,
+      "experimental_supported_tools": []
+    }
+  ]
+}

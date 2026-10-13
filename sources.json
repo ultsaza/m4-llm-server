@@ -1,0 +1,41 @@
+{
+  "upstream": "https://github.com/1architect/macqwen-releases.git",
+  "upstream_revision": "10297d83b619d62ec423546870d1cc1571dbd6eb",
+  "variants": {
+    "api": {
+      "source_revision": "ce3290b4266f083642f6e66e8945efb43d2acad3",
+      "patch": "patches/api.patch",
+      "sha256": "024d90398447a77761cf1778f831dd5ff1d30df65a0eca02b374b46601485a8f"
+    },
+    "sidecar": {
+      "source_revision": "cc1981e25a18c033630a8534a37ba55e0f50e8ea",
+      "patch": "patches/sidecar.patch",
+      "sha256": "c2e09e1a9216661574c01831422f9d9d262b14f34698af5d1459c31be0b60a8e"
+    },
+    "native": {
+      "source_revision": "e2f6f58956543c202390451b219a73365082c619",
+      "patch": "patches/native.patch",
+      "sha256": "dbab9259cc50acbe154939f14faf83369cfce64485284884f525bc38d2b6fbc1"
+    },
+    "slru": {
+      "source_revision": "4bbd79fff6d053e0d23c221a9eeb3e546ffbe088",
+      "patch": "patches/slru.patch",
+      "sha256": "a23516a7fd8e1972a04cf0c32985f2ac95c2d3723f66f5ff5bb26f54f68579e4"
+    },
+    "slru-fraction": {
+      "source_revision": "e52692714b7f7cbbb8f22c7a4675c376a8b48abb",
+      "patch": "patches/slru-fraction.patch",
+      "sha256": "99063eec7563cca5798e720f10be5ef467e301814bcfa7450b943f7f192e9e6b"
+    },
+    "slru-session": {
+      "source_revision": "161b1e2338817a27e02b4f7f52f5012cfd4c284f",
+      "patch": "patches/slru-session.patch",
+      "sha256": "0b0973b555f2633bd29c32bd3cc3e7597051e85bdf580f1ce6b93004416e58f9"
+    },
+    "s3fifo": {
+      "source_revision": "f7b60e8312843ae27aee7fa3e48320cf6010ffe1",
+      "patch": "patches/s3fifo.patch",
+      "sha256": "a0fda59bb06e1a2fc5260d2be9b5994aaa63804ac64933a1b3a09bfadf3fe62c"
+    }
+  }
+}

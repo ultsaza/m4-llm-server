@@ -1,0 +1,2455 @@
+diff --git a/macqwen/server.py b/macqwen/server.py
+index ddc1afb..7e71a64 100644
+--- a/macqwen/server.py
++++ b/macqwen/server.py
+@@ -2,10 +2,18 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
++from contextlib import nullcontext
++from concurrent.futures import ThreadPoolExecutor
+ from http.server import BaseHTTPRequestHandler, HTTPServer
+ import hmac
++import inspect
+ import json
++import math
+ import re
++import select
++import socket
++from socketserver import ThreadingMixIn
++import threading
+ import time
+ import uuid
+ from urllib.parse import urlsplit
+@@ -468,6 +476,8 @@ class ModelService:
+         self.model = f"macqwen-{session.preferences['model']}"
+         self.reused = 0
+         self.rebuilt = 0
++        self.context_limit = None
++        self.request_prompt_tokens = 0
+ 
+     @staticmethod
+     def _substitute_slots(normalized, tokenizer):
+@@ -536,12 +546,20 @@ class ModelService:
+         encode = getattr(backend, "encode", None)
+         common_prefix = getattr(backend, "common_prefix", None)
+         if encode is None or common_prefix is None:
++            if self.context_limit is not None:
++                raise RequestError("backend cannot count the complete prompt", 500)
+             session.reset()
+             backend.append_text(rendered)
+             self.rebuilt += 1
+             return False
+         if ids is None:
+             ids = encode(rendered)
++        if self.context_limit is not None and len(ids) + self.output_budget > self.context_limit:
++            raise RequestError(
++                f"prompt ({len(ids)}) plus requested output ({self.output_budget}) "
++                f"exceeds the {self.context_limit}-token context limit"
++            )
++        self.request_prompt_tokens = len(ids)
+         if getattr(backend, "_replay_needed", False):
+             # The transcript may still be a prefix, but the live cache is
+             # deliberately invalid. Reusing it would make a tool result
+@@ -562,9 +580,11 @@ class ModelService:
+         self.rebuilt += 1
+         return False
+ 
+-    def complete(self, messages, tools, max_tokens, on_text=None) -> Completion:
++    def complete(self, messages, tools, max_tokens, on_text=None, *,
++                 should_cancel=None, on_prefill_progress=None) -> Completion:
+         session = self.session
+         backend = session.backend
++        self.output_budget = max_tokens
+         try:
+             normalized = _normalize_messages(messages)
+             system_index = next(
+@@ -619,10 +639,16 @@ class ModelService:
+                     if on_text is not None:
+                         on_text(None if hold else complete)
+ 
+-            text, stats = backend.generate(
+-                max_tokens=max_tokens,
+-                out=streamed if on_text is not None else None,
+-            )
++            generate_args = dict(max_tokens=max_tokens,
++                                 out=streamed if on_text is not None else None)
++            parameters = inspect.signature(backend.generate).parameters
++            for name, callback in (("should_cancel", should_cancel),
++                                   ("on_prefill_progress", on_prefill_progress)):
++                if callback is not None:
++                    if name not in parameters:
++                        raise RequestError(f"backend lacks required {name} hook", 500)
++                    generate_args[name] = callback
++            text, stats = backend.generate(**generate_args)
+             if on_text is not None:
+                 tail = thinking.finish()
+                 for complete in words.feed(tail) + words.finish():
+@@ -643,12 +669,32 @@ class ModelService:
+             raise
+ 
+ 
+-class MacqwenHTTPServer(HTTPServer):
++class MacqwenHTTPServer(ThreadingMixIn, HTTPServer):
++    daemon_threads = True
++
+     def __init__(self, address, service, api_key=None, allowed_origins=()):
+         super().__init__(address, MacqwenHandler)
+         self.service = service
+         self.api_key = api_key
+         self.allowed_origins = tuple(allowed_origins)
++        self.inference_lock = threading.Lock()
++        self.model_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="macqwen-http-model")
++        self.context_limit = 4096
++        self.default_output_tokens = 512
++        self.max_output_tokens = 1024
++        self.request_timeout = 1200
++        self.heartbeat_interval = 10
++        self.last_request = None
++        if isinstance(service, ModelService):
++            service.context_limit = self.context_limit
++
++    def server_close(self):
++        super().server_close()
++        try:
++            if isinstance(self.service, ModelService):
++                self.model_executor.submit(self.service.session.reset).result()
++        finally:
++            self.model_executor.shutdown(wait=True)
+ 
+ 
+ class MacqwenHandler(BaseHTTPRequestHandler):
+@@ -735,22 +781,46 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+         return value
+ 
+     def _sse_start(self):
++        self._sse_lock = threading.Lock()
++        self._heartbeat_stop = threading.Event()
+         self._headers(content_type="text/event-stream")
+         self.send_header("Cache-Control", "no-cache")
+         self.send_header("Connection", "close")
+         self.end_headers()
+         self._sse_open = True
++        interval = getattr(self.server, "heartbeat_interval", None)
++        if interval:
++            def keepalive():
++                while not self._heartbeat_stop.wait(interval):
++                    try:
++                        self._heartbeat()
++                    except (OSError, ValueError):
++                        self._client_gone = True
++                        break
++            self._heartbeat_thread = threading.Thread(target=keepalive, daemon=True)
++            self._heartbeat_thread.start()
++
++    def _stop_heartbeats(self):
++        event = getattr(self, "_heartbeat_stop", None)
++        if event is not None:
++            event.set()
++        worker = getattr(self, "_heartbeat_thread", None)
++        if worker is not None:
++            worker.join(timeout=1)
+ 
+     def _sse(self, value, event=None):
+         prefix = f"event: {event}\n" if event else ""
+-        self.wfile.write((prefix + "data: " + json.dumps(value) + "\n\n").encode())
+-        self.wfile.flush()
++        with getattr(self, "_sse_lock", nullcontext()):
++            self.wfile.write((prefix + "data: " + json.dumps(value) + "\n\n").encode())
++            self.wfile.flush()
+ 
+     def _heartbeat(self):
+-        self.wfile.write(b": generating\n\n")
+-        self.wfile.flush()
++        with getattr(self, "_sse_lock", nullcontext()):
++            self.wfile.write(b": generating\n\n")
++            self.wfile.flush()
+ 
+     def _sse_chat_error(self, message):
++        self._stop_heartbeats()
+         try:
+             self._sse({"error": {"message": str(message),
+                                  "type": "server_error"}})
+@@ -791,9 +861,15 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+             return
+         path = urlsplit(self.path).path
+         if path == "/health":
+-            self._json({"status": "ok", "model": self.server.service.model})
++            self._json({"status": "busy" if self.server.inference_lock.locked() else "ready",
++                        "model": self.server.service.model,
++                        "context_limit": self.server.context_limit,
++                        "cache_reused": self.server.service.reused,
++                        "cache_rebuilt": self.server.service.rebuilt,
++                        "last_request": self.server.last_request})
+         elif path == "/v1/models":
+             card = model_card(self.server.service)
++            card["context_window"] = getattr(self.server, "context_limit", card["context_window"])
+             self._json({"object": "list", "data": [{
+                 "id": card["slug"],
+                 "object": "model",
+@@ -803,23 +879,34 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+             self._error("route not found", 404)
+ 
+     def do_POST(self):
++        self.close_connection = True
++        self.connection.settimeout(15)
+         if self._reject_foreign_origin():
+             return
+         if not self._authorized():
+             self._error("invalid API key", 401)
+             return
+         self._sse_open = False
++        self._client_gone = False
++        acquired = False
+         try:
+             payload = self._payload()
+             path = urlsplit(self.path).path
+-            if path == "/v1/chat/completions":
+-                self._chat(payload)
+-            elif path == "/v1/messages":
+-                self._anthropic(payload)
+-            elif path == "/v1/responses":
+-                self._responses(payload)
+-            else:
++            if path != "/v1/chat/completions":
+                 self._error("route not found", 404)
++                return
++            sampling = self._validate_chat(payload)
++            if not self.server.inference_lock.acquire(blocking=False):
++                self._headers(503)
++                body = json.dumps({"error":{"message":"model is busy", "type":"server_error"}}).encode()
++                self.send_header("Retry-After", "5")
++                self.send_header("Content-Length", str(len(body)))
++                self.end_headers()
++                self.wfile.write(body)
++                return
++            acquired = True
++            self._deadline = time.monotonic() + self.server.request_timeout
++            self.server.model_executor.submit(self._chat_with_sampling, payload, sampling).result()
+         except RequestError as exc:
+             if not getattr(self, "_sse_open", False):
+                 try:
+@@ -835,13 +922,113 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+                 except (BrokenPipeError, ConnectionResetError):
+                     pass
+ 
+-    def _limit(self, payload, default=4096):
++        finally:
++            self._stop_heartbeats()
++            if acquired:
++                self.server.inference_lock.release()
++
++    def _chat_with_sampling(self, payload, sampling):
++        backend = self.server.service.session.backend
++        previous = backend.sampling
++        backend.sampling = sampling
++        try:
++            self._chat(payload)
++        finally:
++            backend.sampling = previous
++
++    def _validate_chat(self, payload):
++        from macqwen.sampling import INSTRUCT, Sampling
++
++        allowed = {"model", "messages", "tools", "max_tokens", "max_completion_tokens",
++                   "stream", "temperature", "top_p", "top_k", "min_p", "presence_penalty"}
++        unknown = set(payload) - allowed
++        if unknown:
++            raise RequestError("unsupported options: " + ", ".join(sorted(unknown)))
++        if "max_tokens" in payload and "max_completion_tokens" in payload:
++            raise RequestError("specify only one output limit")
++        if payload.get("model", self.server.service.model) != self.server.service.model:
++            raise RequestError("requested model is not loaded")
++        if "stream" in payload and not isinstance(payload["stream"], bool):
++            raise RequestError("stream must be a boolean")
++        _normalize_messages(payload.get("messages"))
++        for message in payload["messages"]:
++            content = message.get("content")
++            if content is None and message.get("role") == "assistant" and message.get("tool_calls"):
++                continue
++            if isinstance(content, str):
++                continue
++            if isinstance(content, list) and all(
++                    isinstance(block, dict) and block.get("type") == "text"
++                    and isinstance(block.get("text"), str) for block in content):
++                continue
++            raise RequestError("this server accepts text content only")
++        tools = payload.get("tools", [])
++        if not isinstance(tools, list) or any(
++                not isinstance(tool, dict) or tool.get("type") != "function"
++                or not isinstance(tool.get("function"), dict)
++                or not isinstance(tool["function"].get("name"), str) for tool in tools):
++            raise RequestError("tools must contain function definitions")
++        self._limit(payload)
++        settings = dict(INSTRUCT)
++        bounds = {"temperature": (0, 2), "top_p": (0, 1), "min_p": (0, 1),
++                  "presence_penalty": (-2, 2), "top_k": (0, 1000)}
++        for name, (low, high) in bounds.items():
++            if name not in payload:
++                continue
++            value = payload[name]
++            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
++                raise RequestError(f"{name} must be finite and numeric")
++            if not low <= value <= high or (name == "top_p" and value == 0):
++                raise RequestError(f"{name} is outside its supported range")
++            if name == "top_k" and not isinstance(value, int):
++                raise RequestError("top_k must be an integer")
++            settings[name] = value
++        return Sampling(**settings)
++
++    def _should_cancel(self):
++        if time.monotonic() >= self._deadline:
++            raise RequestError("request deadline exceeded", 408)
++        if self._client_gone:
++            return True
++        try:
++            if select.select([self.connection], [], [], 0)[0]:
++                if not self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT):
++                    self._client_gone = True
++        except (OSError, ValueError):
++            self._client_gone = True
++        return self._client_gone
++
++    def _complete(self, messages, tools, max_tokens, on_text=None, on_prefill_progress=None):
++        began = time.monotonic()
++        options = {}
++        if isinstance(self.server.service, ModelService) and hasattr(self, "_deadline"):
++            options = {"should_cancel": self._should_cancel,
++                       "on_prefill_progress": on_prefill_progress}
++        result = self.server.service.complete(messages, tools, max_tokens, on_text, **options)
++        stats = result.stats
++        if hasattr(self.server, "last_request"):
++            record = {"wall_seconds": round(time.monotonic() - began, 3),
++                      "prompt_tokens": getattr(self.server.service, "request_prompt_tokens", stats.prompt_tokens),
++                      "prefill_tokens": stats.prompt_tokens, "output_tokens": stats.tokens,
++                      "decode_tok_s": round(getattr(stats, "rate", 0), 3),
++                      "prefill_seconds": round(getattr(stats, "prefill_seconds", 0), 3),
++                      "finish_reason": stats.finish}
++            self.server.last_request = record
++            print(json.dumps({"event": "completion", **record}), flush=True)
++        return result
++
++    def _limit(self, payload, default=None):
++        if default is None:
++            default = getattr(self.server, "default_output_tokens", 4096)
+         value = payload.get(
+             "max_output_tokens",
+             payload.get("max_completion_tokens", payload.get("max_tokens", default)),
+         )
+         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+             raise RequestError("max_tokens must be a positive integer")
++        maximum = getattr(self.server, "max_output_tokens", None)
++        if maximum is not None and value > maximum:
++            raise RequestError(f"requested output exceeds the {maximum}-token limit")
+         return min(value, capabilities(self.server.service)["context_window"])
+ 
+     def _chat(self, payload):
+@@ -852,7 +1039,6 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+         created = int(time.time())
+         if payload.get("stream"):
+             max_tokens = self._limit(payload)
+-            self._sse_start()
+             try:
+ 
+                 def chunk(delta, finish=None):
+@@ -862,40 +1048,50 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+                         "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                     })
+ 
+-                chunk({"role": "assistant", "content": ""})
++                def begin_stream(*_args):
++                    if not self._sse_open:
++                        self._sse_start()
++                        chunk({"role": "assistant", "content": ""})
+ 
+                 def on_text(text):
++                    begin_stream()
+                     self._heartbeat() if text is None else chunk({"content": text})
+ 
+-                result = service.complete(messages, tools, max_tokens, on_text)
++                result = self._complete(messages, tools, max_tokens, on_text, begin_stream)
++                begin_stream()
+                 for index, call in enumerate(result.tool_calls):
+                     chunk({"tool_calls": [{
+                         "index": index, "id": call["id"], "type": "function",
+                         "function": {"name": call["name"], "arguments": call["arguments"]},
+                     }]})
+                 chunk({}, "tool_calls" if result.tool_calls else result.stats.finish)
++                self._stop_heartbeats()
+                 self.wfile.write(b"data: [DONE]\n\n")
+                 self.wfile.flush()
+             except (BrokenPipeError, ConnectionResetError):
+                 pass
+             except Exception as exc:
++                if not self._sse_open and isinstance(exc, RequestError):
++                    raise
++                begin_stream()
+                 self._sse_chat_error(exc)
+             return
+-        result = service.complete(messages, tools, self._limit(payload))
++        result = self._complete(messages, tools, self._limit(payload))
+         message = {"role": "assistant", "content": result.text or None}
+         if result.tool_calls:
+             message["tool_calls"] = [{
+                 "id": call["id"], "type": "function",
+                 "function": {"name": call["name"], "arguments": call["arguments"]},
+             } for call in result.tool_calls]
++        prompt_tokens = getattr(service, "request_prompt_tokens", result.stats.prompt_tokens)
+         self._json({
+             "id": ident, "object": "chat.completion", "created": created,
+             "model": service.model,
+             "choices": [{"index": 0, "message": message,
+                          "finish_reason": "tool_calls" if result.tool_calls else result.stats.finish}],
+-            "usage": {"prompt_tokens": result.stats.prompt_tokens,
++            "usage": {"prompt_tokens": prompt_tokens,
+                       "completion_tokens": result.stats.tokens,
+-                      "total_tokens": result.stats.prompt_tokens + result.stats.tokens},
++                      "total_tokens": prompt_tokens + result.stats.tokens},
+         })
+ 
+     def _anthropic(self, payload):
+@@ -1069,18 +1265,16 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+ def serve(session, host: str, port: int, api_key: str | None = None,
+           allowed_origins=()) -> None:
+     """Reset the model when the server starts and when it stops."""
+-    session.reset()
+     server = MacqwenHTTPServer(
+         (host, port), ModelService(session), api_key, allowed_origins)
++    server.model_executor.submit(session.reset).result()
+     print(f"server ready at http://{host}:{server.server_port}")
+     if allowed_origins:
+         print(f"browser origins allowed: {', '.join(allowed_origins)}")
+-    print("OpenAI: /v1/chat/completions and /v1/responses")
+-    print("Anthropic: /v1/messages")
++    print("OpenAI: /v1/chat/completions (text); context 4096, output 512/1024")
+     try:
+         server.serve_forever()
+     except KeyboardInterrupt:
+         print("\nserver stopped")
+     finally:
+         server.server_close()
+-        session.reset()
+diff --git a/models/flashnext/expert_cache.py b/models/flashnext/expert_cache.py
+index 6fd68b6..25b5021 100644
+--- a/models/flashnext/expert_cache.py
++++ b/models/flashnext/expert_cache.py
+@@ -1695,7 +1695,7 @@ class StreamingSwitchGLU(nn.Module):
+         self, indices, routed, flat_input, scores, shared_y, shared, shared_gate,
+     ):
+         """Custom Metal decode with every routed expert addressed in the pool."""
+-        from .expert_pool import SLOT_BIT, for_store
++        from .expert_pool import SLOT_BIT, drain_futures, for_store
+ 
+         store = self.gate_proj.cache.store
+         pool = for_store(store, self.gate_proj.group_size)
+@@ -1703,15 +1703,23 @@ class StreamingSwitchGLU(nn.Module):
+         self.hits += len(routed) - len(misses)
+         self.misses += len(misses)
+         if misses:
+-            prefix = self.gate_proj.cache.prefix.rsplit(".", 1)[0]
+-            chunk = int(os.environ.get("FLASHNEXT_STREAM_PACK_CHUNK", "2")) or 2
+             began = time.perf_counter()
+-            futures = pool.fill(prefix, misses, _submit_read, chunk)
+-            if _KEEPWARM[0]:
+-                _keep_gpu_warm_until(futures)
+-            timings = [] if _PROFILE else None
+-            for future in futures:
+-                _resolve_future(future, timings)
++            futures = []
++            try:
++                prefix = self.gate_proj.cache.prefix.rsplit(".", 1)[0]
++                chunk = int(os.environ.get("FLASHNEXT_STREAM_PACK_CHUNK", "2")) or 2
++                futures = pool.fill(prefix, misses, _submit_read, chunk)
++                if _KEEPWARM[0]:
++                    _keep_gpu_warm_until(futures)
++                timings = [] if _PROFILE else None
++                for future in futures:
++                    _resolve_future(future, timings)
++            except BaseException:
++                # Even a keep-warm or first Future failure must wait for all
++                # queued writes before a later inference can reuse slots.
++                drain_futures(futures)
++                pool.invalidate(self.layer_id, misses)
++                raise
+             if _PROFILE:
+                 ended = time.perf_counter()
+                 _TIMERS["io_wait"] += ended - began
+diff --git a/models/flashnext/expert_pool.py b/models/flashnext/expert_pool.py
+index c6ea2de..e5365a6 100644
+--- a/models/flashnext/expert_pool.py
++++ b/models/flashnext/expert_pool.py
+@@ -1,4 +1,4 @@
+-"""Application-owned LRU pool of expert records (research, off by default).
++"""Application-owned LRU or opt-in SLRU pool of expert records (research, off by default).
+ 
+ Every cached expert row the production path reads is copied out of the file
+ cache, about 880 MB/token and about 37 ms/token in the 2026-09-23 read replay.
+@@ -26,11 +26,12 @@ from __future__ import annotations
+ import fcntl
+ import mmap
+ import os
+-from collections import OrderedDict
+ 
+ import numpy as np
+ 
+ from .slab_pack import get_slab_layout, libc_mlock
++from .expert_pool_policy import (POLICY_FLAG, FRACTION_FLAG, ExpertPoolPolicy,
++                                 canonical_policy, canonical_protected_fraction)
+ 
+ SIZE_FLAG = "FLASHNEXT_EXPERT_POOL_GB"
+ LOCK_FLAG = "FLASHNEXT_EXPERT_POOL_LOCK"
+@@ -54,11 +55,38 @@ def enabled() -> bool:
+     return configured_gb() > 0
+ 
+ 
++def configured_cache_policy():
++    value = os.environ.get(POLICY_FLAG, '')
++    policy = canonical_policy(value)
++    if value and not enabled():
++        raise ValueError(f'{POLICY_FLAG} requires an enabled expert pool')
++    return policy
++
++
++def configured_protected_fraction(policy, pool_enabled):
++    value = os.environ.get(FRACTION_FLAG)
++    if value is None:
++        return 0.7
++    fraction = canonical_protected_fraction(value)
++    if policy != 'slru' or not pool_enabled:
++        raise ValueError(f'{FRACTION_FLAG} requires SLRU and an enabled expert pool')
++    return fraction
++
++
+ class ExpertPool:
+     def __init__(self, store, size_bytes: int, group_size: int = 32,
+                  lock: bool = False):
++        # An explicit constructor enables its pool; the model-load hook also
++        # checks that an environment-selected policy has an enabled GB budget.
++        self.cache_policy = canonical_policy(os.environ.get(POLICY_FLAG, ""))
++        self.slru_protected_fraction = configured_protected_fraction(self.cache_policy, True)
+         layout = get_slab_layout(group_size)
+         self.store = store
++        self.layout = layout
++        from .small_sidecar import for_pool
++
++        # Validation happens before any large pool allocation or readiness.
++        self.sidecar = for_pool(store, layout)
+         self.stride = layout.record_stride
+         self.offsets = {key: layout.offset(*key) for key in _PARTS}
+         self.slots = (int(size_bytes) - HEADER) // self.stride
+@@ -79,45 +107,38 @@ class ExpertPool:
+             np.frombuffer(self._mm, dtype=np.uint32), copy=False
+         )
+         self._view = memoryview(self._mm)
+-        self._slot_of: "OrderedDict[tuple, int]" = OrderedDict()
+-        self._free = list(range(self.slots - 1, -1, -1))
++        self._policy = ExpertPoolPolicy(self.slots, self.cache_policy,
++                                        protected_fraction=self.slru_protected_fraction)
++        self._slot_of = self._policy.slot_of
++        self._free = self._policy.free
+         self._fds: dict = {}
+         self.hits = 0
+         self.misses = 0
+ 
+     def assign(self, layer: int, experts):
+         """Return ({expert: slot}, [(expert, slot) to fill]) for one layer."""
+-        slot_of = self._slot_of
+-        slots, misses = {}, []
+-        for expert in experts:
+-            key = (layer, expert)
+-            slot = slot_of.get(key)
+-            if slot is not None:
+-                slot_of.move_to_end(key)
+-                slots[expert] = slot
+-        self.hits += len(slots)
+-        for expert in experts:
+-            if expert in slots:
+-                continue
+-            if self._free:
+-                slot = self._free.pop()
+-            else:
+-                _old, slot = slot_of.popitem(last=False)
+-            slot_of[(layer, expert)] = slot
+-            slots[expert] = slot
+-            misses.append((expert, slot))
++        slots, misses = self._policy.assign(layer, experts)
++        self.hits += len(slots) - len(misses)
+         self.misses += len(misses)
+         return slots, misses
+ 
++    def policy_diagnostics(self):
++        """Bounded queue sample and counts; never copies the full cache state."""
++        return self._policy.diagnostics()
++
+     def _fd(self, shard: str) -> int:
+         fd = self._fds.get(shard)
+         if fd is None:
+             fd = os.open(os.path.join(self.store.dir, shard), os.O_RDONLY)
+-            fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
+             try:
+-                fcntl.fcntl(fd, getattr(fcntl, "F_RDAHEAD", 45), 0)
+-            except OSError:
+-                pass
++                fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
++                try:
++                    fcntl.fcntl(fd, getattr(fcntl, "F_RDAHEAD", 45), 0)
++                except OSError:
++                    pass
++            except BaseException:
++                os.close(fd)
++                raise
+             self._fds[shard] = fd
+         return fd
+ 
+@@ -131,23 +152,79 @@ class ExpertPool:
+                 raise OSError(f"short expert pool read for {name} row {expert}")
+ 
+     def fill(self, prefix: str, misses, submit, chunk: int = 2):
+-        """Queue the nine row reads of every miss; returns the futures."""
++        """Queue the original rows or three weights plus one metadata read."""
++        if chunk < 1:
++            raise ValueError("expert pool read chunk must be positive")
+         futures = []
+-        for projection, part in _PARTS:
+-            name = f"{prefix}.{projection}.{part}"
+-            offset = HEADER + self.offsets[(projection, part)]
+-            for start in range(0, len(misses), chunk):
+-                targets = [
+-                    (expert, offset + slot * self.stride)
+-                    for expert, slot in misses[start:start + chunk]
+-                ]
+-                futures.append(submit(self._fill_part, name, targets))
++        parts = _PARTS if self.sidecar is None else tuple(
++            (projection, "weight") for projection in ("gate_proj", "up_proj", "down_proj")
++        )
++        try:
++            for projection, part in parts:
++                name = f"{prefix}.{projection}.{part}"
++                offset = HEADER + self.offsets[(projection, part)]
++                for start in range(0, len(misses), chunk):
++                    targets = [
++                        (expert, offset + slot * self.stride)
++                        for expert, slot in misses[start:start + chunk]
++                    ]
++                    futures.append(submit(self._fill_part, name, targets))
++            if self.sidecar is not None:
++                layer = self.sidecar.layer_for_prefix(prefix)
++                for start in range(0, len(misses), chunk):
++                    futures.append(submit(
++                        self.sidecar.read_into_slots, layer,
++                        misses[start:start + chunk], self._view, self.layout,
++                    ))
++        except BaseException:
++            # A caller cannot see our partially built list. Complete all
++            # submitted writes here before allowing it to invalidate slots.
++            drain_futures(futures)
++            raise
+         return futures
+ 
++    def invalidate(self, layer, misses):
++        """Forget incomplete new slots after all their writes have drained."""
++        self._policy.invalidate(layer, misses)
++
+     def close(self) -> None:
+         for fd in self._fds.values():
+             os.close(fd)
+         self._fds.clear()
++        if self.sidecar is not None:
++            self.sidecar.close()
++            if getattr(self.store, "_flashnext_pool_small_sidecar", None) is self.sidecar:
++                self.store._flashnext_pool_small_sidecar = None
++
++
++def drain_futures(futures):
++    """Drain every submitted read, preserving the original failure upstream."""
++    for future in futures:
++        while True:
++            try:
++                if future.done():
++                    break
++                future.result()
++            except BaseException:
++                # A wait can be interrupted while a writer is still running.
++                # Only the Future's completion permits slot invalidation;
++                # completed task errors/cancellation are handled by done().
++                continue
++
++
++def initialize_sidecar(store):
++    """Validate opt-in assets during load, before the backend reports ready."""
++    from .small_sidecar import POOL_FLAG, for_pool
++
++    policy = configured_cache_policy()
++    fraction = configured_protected_fraction(policy, enabled())
++    store._flashnext_pool_cache_policy = policy
++    store._flashnext_pool_slru_protected_fraction = fraction
++    if not os.environ.get(POOL_FLAG, ""):
++        return None
++    if not enabled():
++        raise ValueError(f"{POOL_FLAG} requires an enabled expert pool")
++    return for_pool(store, get_slab_layout(32))
+ 
+ 
+ def for_store(store, group_size: int = 32):
+diff --git a/models/flashnext/expert_pool_policy.py b/models/flashnext/expert_pool_policy.py
+new file mode 100644
+index 0000000..fd6cbe2
+--- /dev/null
++++ b/models/flashnext/expert_pool_policy.py
+@@ -0,0 +1,108 @@
++"""Bounded slot ownership and opt-in segmented LRU; pure stdlib."""
++from collections import OrderedDict
++from itertools import islice
++import math
++
++POLICY_FLAG = 'FLASHNEXT_EXPERT_POOL_CACHE_POLICY'
++FRACTION_FLAG = 'FLASHNEXT_EXPERT_POOL_SLRU_PROTECTED_FRACTION'
++
++
++def canonical_policy(value):
++    name = value or 'lru'
++    if name not in ('lru', 'slru'):
++        raise ValueError(f'{POLICY_FLAG}: unknown cache policy {name!r}')
++    return name
++
++
++def canonical_protected_fraction(value):
++    try:
++        fraction = float(value) if not isinstance(value, bool) else float('nan')
++    except (TypeError, ValueError, OverflowError) as error:
++        raise ValueError(f'{FRACTION_FLAG} must be finite and strictly between 0 and 1') from error
++    if not math.isfinite(fraction) or not 0 < fraction < 1:
++        raise ValueError(f'{FRACTION_FLAG} must be finite and strictly between 0 and 1')
++    return fraction
++
++
++class ExpertPoolPolicy:
++    def __init__(self, capacity, policy='lru', protected_fraction=0.7):
++        self.policy = canonical_policy(policy)
++        self.protected_fraction = canonical_protected_fraction(protected_fraction)
++        if self.policy != 'slru' and self.protected_fraction != 0.7:
++            raise ValueError(f'{FRACTION_FLAG} requires SLRU')
++        if capacity < 1:
++            raise ValueError('expert pool capacity must be positive')
++        self.capacity = capacity
++        self.protected_capacity = int(self.protected_fraction * capacity)
++        self.slot_of = OrderedDict()
++        self.free = list(range(capacity - 1, -1, -1))
++        # Only SLRU stores extra keys, at most one queue entry per slot.
++        self._probation = OrderedDict()
++        self._protected = OrderedDict()
++
++    def _hit(self, key):
++        self.slot_of.move_to_end(key)
++        if self.policy == 'lru':
++            return
++        if key in self._protected:
++            self._protected.move_to_end(key)
++        else:
++            del self._probation[key]
++            self._protected[key] = None
++            if len(self._protected) > self.protected_capacity:
++                demoted, _ = self._protected.popitem(last=False)
++                self._probation[demoted] = None
++
++    def _victim(self, requested):
++        if self.policy == 'lru':
++            return self.slot_of.popitem(last=False)[1]
++        for queue in (self._probation, self._protected):
++            for key in queue:
++                if key not in requested:
++                    del queue[key]
++                    return self.slot_of.pop(key)
++        raise RuntimeError('expert pool has no eligible victim')
++
++    def assign(self, layer, experts):
++        experts = list(dict.fromkeys(experts))
++        if len(experts) > self.capacity:
++            raise ValueError('expert request exceeds pool capacity')
++        requested = {(layer, expert) for expert in experts}
++        assigned, misses = {}, []
++        for expert in experts:
++            key = (layer, expert)
++            slot = self.slot_of.get(key)
++            if slot is not None:
++                self._hit(key)
++                assigned[expert] = slot
++        for expert in experts:
++            if expert in assigned:
++                continue
++            slot = self.free.pop() if self.free else self._victim(requested)
++            key = (layer, expert)
++            self.slot_of[key] = slot
++            if self.policy == 'slru':
++                self._probation[key] = None
++            assigned[expert] = slot
++            misses.append((expert, slot))
++        return assigned, misses
++
++    def invalidate(self, layer, misses):
++        free = set(self.free)
++        for expert, slot in misses:
++            key = (layer, expert)
++            if self.slot_of.get(key) == slot:
++                del self.slot_of[key]
++                self._probation.pop(key, None)
++                self._protected.pop(key, None)
++                if slot not in free:
++                    self.free.append(slot)
++                    free.add(slot)
++
++    def diagnostics(self):
++        probation = self._probation if self.policy == 'slru' else self.slot_of
++        return {'policy': self.policy, 'protected_fraction': self.protected_fraction,
++                'protected_capacity': self.protected_capacity,
++                'probation_count': len(probation), 'protected_count': len(self._protected),
++                'probation_oldest': list(islice(probation, 8)),
++                'protected_oldest': list(islice(self._protected, 8))}
+diff --git a/models/flashnext/loader.py b/models/flashnext/loader.py
+index 17d53a9..7008445 100644
+--- a/models/flashnext/loader.py
++++ b/models/flashnext/loader.py
+@@ -133,6 +133,13 @@ def load_streaming(
+         compiled.install()
+     path = Path(os.path.expanduser(model_dir))
+     store = SafeTensorStore(str(path))
++    from .expert_pool import initialize_sidecar
++
++    try:
++        initialize_sidecar(store)
++    except BaseException:
++        store.close()
++        raise
+     mtp_path = path / "model-mtp.safetensors"
+     # Capability detection reads config/index/tensor layout, never the
+     # directory name. Both sidecar and indexed MTP present fails closed.
+diff --git a/models/flashnext/small_sidecar.py b/models/flashnext/small_sidecar.py
+index 9892b76..5a4e92a 100644
+--- a/models/flashnext/small_sidecar.py
++++ b/models/flashnext/small_sidecar.py
+@@ -12,13 +12,24 @@ rows; arithmetic does not change.
+ 
+ ``FLASHNEXT_SMALL_SIDECAR`` names the sidecar directory. Only layers listed in
+ its manifest use it, and only on the stream-pack path. The manifest records
+-the checkpoint identity; a mismatch disables the sidecar.
++the checkpoint identity; a mismatch refuses initialization.
++
++``FLASHNEXT_EXPERT_POOL_SMALL_SIDECAR`` selects a separate, opt-in pool
++sidecar built by ``build_pool``. All pool layers are checked before readiness;
++readonly F_NOCACHE/F_RDAHEAD descriptors are hashed with a bounded buffer,
++then retained for direct scatter into arbitrary pool slots. Legacy stream
++readers and the legacy ``build`` contract retain their original behavior.
+ """
+ from __future__ import annotations
+ 
+ import fcntl
++import hashlib
+ import json
+ import os
++import shutil
++import stat
++import tempfile
++import time
+ from pathlib import Path
+ 
+ from .slab_pack import (
+@@ -111,6 +122,283 @@ def for_store(store) -> SmallSidecar | None:
+     return sidecar
+ 
+ 
++POOL_FLAG = "FLASHNEXT_EXPERT_POOL_SMALL_SIDECAR"
++POOL_FORMAT = "flashnext-expert-pool-small-sidecar-v1"
++HASH_CHUNK = 1 << 20
++POOL_HEADER = 4096
++
++
++def _pool_layout(layout) -> dict:
++    from .slab_pack import get_slab_layout
++
++    expected = get_slab_layout(32)
++    if layout != expected:
++        raise ValueError("pool small sidecar requires Q4/G32")
++    for projection in ("gate_proj", "up_proj", "down_proj"):
++        if layout.offset(projection, "biases") != layout.offset(projection, "scales") + ROW_BYTES:
++            raise ValueError("pool sidecar scale/bias pairs must be adjacent")
++    return {
++        "name": layout.name, "record_stride": layout.record_stride,
++        "offsets": dict(layout.offsets),
++        "shapes": {name: list(shape) for name, shape in layout.shapes},
++        "weight_dtype": "U32", "metadata_dtype": "BF16",
++        "weight_row_bytes": 819200, "metadata_row_bytes": ROW_BYTES,
++    }
++
++
++def _pool_contract(store, layout):
++    """Validate every pool layer's nine refs, plus declared model geometry."""
++    from .routing import _switch_prefixes
++
++    descriptor = _pool_layout(layout)
++    prefixes = {int(layer): prefix for layer, prefix in _switch_prefixes(store).items()
++                if int(layer) > 0}
++    if not prefixes:
++        raise ValueError("pool sidecar checkpoint has no pool layers")
++    config_path = Path(store.dir) / "config.json"
++    config = json.loads(config_path.read_text()) if config_path.exists() else {}
++    text = config.get("text_config", config.get("llm_config", config))
++    quantization = config.get("quantization", {})
++    for name, expected in (("bits", 4), ("group_size", 32), ("mode", "affine")):
++        if name in quantization and quantization[name] != expected:
++            raise ValueError("configured quantization differs from Q4/G32 affine pool sidecar")
++    declared_layers = text.get("num_hidden_layers")
++    declared_experts = text.get("num_experts")
++    if declared_layers is not None:
++        if type(declared_layers) is not int or declared_layers < 2:
++            raise ValueError("invalid configured pool layer count")
++        if set(prefixes) != set(range(1, declared_layers)):
++            raise ValueError("checkpoint pool layers differ from configured geometry")
++    if declared_experts is not None and (type(declared_experts) is not int or declared_experts < 1):
++        raise ValueError("invalid configured expert count")
++    experts = {}
++    for layer, prefix in sorted(prefixes.items()):
++        count = None
++        for projection in ("gate_proj", "up_proj", "down_proj"):
++            for part in ("weight", "scales", "biases"):
++                name = f"{prefix}.{projection}.{part}"
++                ref = store.refs.get(name)
++                if ref is None or len(ref.shape) != 3:
++                    raise ValueError(f"pool sidecar missing or invalid tensor: {name}")
++                if tuple(ref.shape[1:]) != layout.shape(projection, part):
++                    raise ValueError(f"pool sidecar tensor geometry differs: {name}")
++                dtype = "U32" if part == "weight" else "BF16"
++                size = 819200 if part == "weight" else ROW_BYTES
++                if ref.dtype != dtype or ref.row_bytes != size:
++                    raise ValueError(f"pool sidecar tensor dtype/row bytes differ: {name}")
++                if count is None:
++                    count = int(ref.shape[0])
++                if count < 1 or ref.shape[0] != count:
++                    raise ValueError(f"pool sidecar expert counts differ: {name}")
++        if declared_experts is not None and count != declared_experts:
++            raise ValueError(f"pool sidecar experts differ from configured geometry: layer {layer}")
++        experts[layer] = count
++    if len(set(experts.values())) != 1:
++        raise ValueError("pool sidecar layers must have the same expert count")
++    return prefixes, experts, descriptor
++
++
++def _file_signature(fd):
++    value = os.fstat(fd)
++    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
++
++
++def _hash_fd(fd, size: int) -> str:
++    """Hash a retained descriptor with at most 1 MiB of payload live."""
++    digest = hashlib.sha256()
++    offset = 0
++    while offset < size:
++        data = os.pread(fd, min(HASH_CHUNK, size - offset), offset)
++        if not data:
++            raise OSError("short sidecar read during digest validation")
++        digest.update(data)
++        offset += len(data)
++        del data
++    return digest.hexdigest()
++
++
++def _pool_fd(path):
++    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
++    try:
++        info = os.fstat(fd)
++        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o222:
++            raise ValueError(f"pool sidecar payload must be a readonly regular file: {path}")
++        fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
++        fcntl.fcntl(fd, getattr(fcntl, "F_RDAHEAD", 45), 0)
++        return fd
++    except BaseException:
++        os.close(fd)
++        raise
++
++
++class PoolSmallSidecar:
++    """Fail-closed pool reader; retains the very FDs whose hashes passed."""
++
++    def __init__(self, store, directory, layout):
++        from .routing import checkpoint_identity_for_store
++
++        began = time.perf_counter()
++        self.directory = Path(directory)
++        self.layout = layout
++        self._fds = {}
++        self._closed = False
++        self.validated_bytes = 0
++        self.prefixes, experts, descriptor = _pool_contract(store, layout)
++        self.layers = frozenset(self.prefixes)
++        self.experts = experts
++        raw = (self.directory / "manifest.json").read_bytes()
++        self.manifest_identity = hashlib.sha256(raw).hexdigest()
++        manifest = json.loads(raw)
++        identity = checkpoint_identity_for_store(store)
++        required = {
++            "format": POOL_FORMAT, "checkpoint_identity": identity,
++            "layers": sorted(self.layers), "experts": {str(layer): count for layer, count in experts.items()},
++            "group_size": 32, "bits": 4, "record_bytes": RECORD_BYTES,
++            "layout": descriptor,
++        }
++        if not identity or any(manifest.get(key) != value for key, value in required.items()):
++            raise ValueError(f"pool sidecar manifest/checkpoint/layout mismatch in {self.directory}")
++        files = manifest.get("files")
++        if not isinstance(files, dict) or set(files) != {str(layer) for layer in self.layers}:
++            raise ValueError("pool sidecar manifest must describe every required layer")
++        self._pair_targets = tuple(layout.offset(projection, "scales")
++                                   for projection in ("gate_proj", "up_proj", "down_proj"))
++        try:
++            for layer in sorted(self.layers):
++                entry = files[str(layer)]
++                size = experts[layer] * RECORD_BYTES
++                if not isinstance(entry, dict) or entry.get("size") != size:
++                    raise ValueError(f"pool sidecar manifest size mismatch: layer {layer}")
++                expected_path = layer_path(self.directory, layer)
++                if entry.get("path") != expected_path.name:
++                    raise ValueError(f"pool sidecar manifest path mismatch: layer {layer}")
++                fd = _pool_fd(expected_path)
++                self._fds[layer] = fd
++                before = _file_signature(fd)
++                if before[2] != size:
++                    raise ValueError(f"pool sidecar payload size mismatch: layer {layer}")
++                digest = _hash_fd(fd, size)
++                if _file_signature(fd) != before:
++                    raise ValueError(f"pool sidecar payload changed during validation: layer {layer}")
++                if entry.get("sha256") != digest:
++                    raise ValueError(f"pool sidecar digest mismatch: layer {layer}")
++                self.validated_bytes += size
++        except BaseException:
++            self.close()
++            raise
++        self.validation_seconds = time.perf_counter() - began
++
++    def fd(self, layer):
++        if self._closed:
++            raise RuntimeError("pool sidecar is closed")
++        return self._fds[layer]
++
++    def layer_for_prefix(self, prefix):
++        for layer, expected in self.prefixes.items():
++            if prefix == expected:
++                return layer
++        raise ValueError(f"prefix absent from validated pool sidecar: {prefix}")
++
++    def read_into_slots(self, layer, misses, pool_view, layout):
++        """Scatter one contiguous record to the three paired metadata gaps."""
++        if layout != self.layout:
++            raise ValueError("pool small sidecar requires its validated Q4/G32 layout")
++        fd = self.fd(layer)
++        view = memoryview(pool_view)
++        for expert, slot in misses:
++            if expert < 0 or expert >= self.experts[layer] or slot < 0:
++                raise ValueError("pool sidecar expert or slot outside validated geometry")
++            base = POOL_HEADER + slot * layout.record_stride
++            if base + layout.record_stride > len(view):
++                raise ValueError("pool sidecar slot outside destination buffer")
++            targets = [view[base + offset:base + offset + PAIR_BYTES]
++                       for offset in self._pair_targets]
++            if os.preadv(fd, targets, expert * RECORD_BYTES) != RECORD_BYTES:
++                raise OSError(f"short pool sidecar read, layer {layer} expert {expert}")
++
++    def close(self):
++        for fd in self._fds.values():
++            os.close(fd)
++        self._fds.clear()
++        self._closed = True
++
++
++def for_pool(store, layout):
++    """Validate once at startup and reuse that object when allocating a pool."""
++    directory = os.environ.get(POOL_FLAG, "")
++    if not directory:
++        return None
++    _pool_layout(layout)
++    sidecar = getattr(store, "_flashnext_pool_small_sidecar", None)
++    if sidecar is None:
++        sidecar = PoolSmallSidecar(store, Path(directory).expanduser(), layout)
++        store._flashnext_pool_small_sidecar = sidecar
++    elif sidecar.directory != Path(directory).expanduser() or sidecar.layout != layout:
++        raise ValueError("pool sidecar configuration changed after startup")
++    return sidecar
++
++
++def _fsync_directory(path):
++    fd = os.open(path, os.O_RDONLY)
++    try:
++        os.fsync(fd)
++    finally:
++        os.close(fd)
++
++
++def _build(store, layers, directory, prefix_for_layer, manifest):
++    """Wrap legacy generation in private staging and atomic publication."""
++    directory = Path(directory)
++    if os.path.lexists(directory):
++        raise FileExistsError(f"sidecar destination already exists: {directory}")
++    directory.parent.mkdir(parents=True, exist_ok=True)
++    stage = Path(tempfile.mkdtemp(prefix=f".{directory.name}-", dir=directory.parent))
++    try:
++        # Legacy O_TRUNC is confined to this unique, empty private stage.
++        # Its write and comparison descriptors already use F_NOCACHE=1.
++        written = build(store, layers, stage, prefix_for_layer)
++        files = {}
++        for layer, experts in written.items():
++            path = layer_path(stage, layer)
++            path.chmod(0o444)
++            check = _pool_fd(path)
++            try:
++                os.fsync(check)
++                before = _file_signature(check)
++                size = experts * RECORD_BYTES
++                if before[2] != size:
++                    raise ValueError(f"sidecar size differs: layer {layer}")
++                digest = _hash_fd(check, size)
++                if _file_signature(check) != before:
++                    raise ValueError(f"sidecar changed during verification: layer {layer}")
++                files[str(layer)] = {"path": path.name, "size": size, "sha256": digest}
++            finally:
++                os.close(check)
++        # Identity is cheap (headers/index/config and shard stat), distinct
++        # from the byte comparisons legacy build performed for every row.
++        from .slab_pack import checkpoint_identity
++
++        if checkpoint_identity(store.dir) != manifest["checkpoint_identity"]:
++            raise ValueError("checkpoint changed during pool sidecar construction")
++        manifest.update({"layers": sorted(written), "experts": {str(k): v for k, v in written.items()},
++                         "record_bytes": RECORD_BYTES, "files": files})
++        with (stage / "manifest.json").open("x") as handle:
++            json.dump(manifest, handle, indent=1)
++            handle.write("\n")
++            handle.flush()
++            os.fchmod(handle.fileno(), 0o444)
++            os.fsync(handle.fileno())
++        _fsync_directory(stage)
++        if os.path.lexists(directory):
++            raise FileExistsError(f"sidecar destination already exists: {directory}")
++        os.rename(stage, directory)
++        _fsync_directory(directory.parent)
++        return written
++    finally:
++        if stage.exists():
++            shutil.rmtree(stage)
++
++
+ def build(store, layers, directory, prefix_for_layer) -> dict:
+     """Write one sidecar file per layer, bypassing the page cache.
+ 
+@@ -171,3 +459,18 @@ def build(store, layers, directory, prefix_for_layer) -> dict:
+         for fd in sources.values():
+             os.close(fd)
+     return written
++
++
++def build_pool(store, directory) -> dict:
++    """Build every required Q4/G32 pool layer from its validated nine refs."""
++    from .routing import checkpoint_identity_for_store
++    from .slab_pack import get_slab_layout
++
++    prefixes, _experts, descriptor = _pool_contract(store, get_slab_layout(32))
++    identity = checkpoint_identity_for_store(store)
++    if not identity:
++        raise ValueError("pool sidecar requires a checkpoint identity")
++    return _build(store, sorted(prefixes), directory, prefixes.__getitem__, {
++        "format": POOL_FORMAT, "checkpoint_identity": identity,
++        "group_size": 32, "bits": 4, "layout": descriptor,
++    })
+diff --git a/models/flashnext/store.py b/models/flashnext/store.py
+index 01877b3..f4d64b3 100644
+--- a/models/flashnext/store.py
++++ b/models/flashnext/store.py
+@@ -606,6 +606,14 @@ class SafeTensorStore:
+         return np.asarray(self._view(name))
+ 
+     def close(self) -> None:
++        pool = getattr(self, "_flashnext_expert_pool", None)
++        if pool is not None:
++            pool.close()
++            self._flashnext_expert_pool = None
++        sidecar = getattr(self, "_flashnext_pool_small_sidecar", None)
++        if sidecar is not None:
++            sidecar.close()
++            self._flashnext_pool_small_sidecar = None
+         self._unlock_experts()
+         self.unpin_all()
+         self._shared_views.clear()
+diff --git a/models/flashnext/tests/bench/build_small_sidecar.py b/models/flashnext/tests/bench/build_small_sidecar.py
+index 0867a09..7527aee 100644
+--- a/models/flashnext/tests/bench/build_small_sidecar.py
++++ b/models/flashnext/tests/bench/build_small_sidecar.py
+@@ -6,6 +6,11 @@ only layers that stream through the expert-major record path. Every record is
+ written and read back with F_NOCACHE and compared with the checkpoint.
+ 
+     python -m models.flashnext.tests.bench.build_small_sidecar
++    python -m models.flashnext.tests.bench.build_small_sidecar --pool --out /new/sidecar
++
++The pool mode validates Q4/G32 geometry, includes all configured layers after
++layer zero, and publishes a readonly manifest/payload directory in one rename.
++Existing destinations are refused; it never rewrites an existing pool sidecar.
+ """
+ from __future__ import annotations
+ 
+@@ -25,8 +30,11 @@ from macqwen.results import output_path  # noqa: E402
+ def main() -> int:
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--out", default="")
++    parser.add_argument("--pool", action="store_true", help="build all expert-pool layers atomically")
++    parser.add_argument("--checkpoint", default="", help="explicit checkpoint directory")
++    parser.add_argument("--report", default="", help="build summary JSON destination")
+     args = parser.parse_args()
+-    record = output_path("flashnext", "small-sidecar", "build.json", "")
++    record = output_path("flashnext", "pool-small-sidecar" if args.pool else "small-sidecar", "build.json", args.report)
+ 
+     from models.flashnext.settings.launch import apply_chat_environment
+ 
+@@ -37,9 +45,38 @@ def main() -> int:
+     from models.flashnext.routing import checkpoint_identity_for_store
+     from models.flashnext.store import SafeTensorStore
+ 
+-    checkpoint = str(resolve_flashnext(os.environ.get("MACQWEN_FLASHNEXT_MODEL")))
++    checkpoint = (str(Path(args.checkpoint).expanduser()) if args.checkpoint else
++                  str(resolve_flashnext(os.environ.get("MACQWEN_FLASHNEXT_MODEL"))))
+     store = SafeTensorStore(checkpoint)
+     identity = checkpoint_identity_for_store(store)
++    if args.pool:
++        directory = Path(os.path.expanduser(
++            args.out or f"~/.cache/flashnext/pool-small-sidecar-{identity[:16]}"
++        ))
++        began = time.perf_counter()
++        try:
++            written = small_sidecar.build_pool(store, directory)
++            build_seconds = time.perf_counter() - began
++            from models.flashnext.slab_pack import get_slab_layout
++
++            sidecar = small_sidecar.PoolSmallSidecar(store, directory, get_slab_layout(32))
++            try:
++                summary = {
++                    "directory": str(directory), "layers": sorted(written),
++                    "bytes": sum(written.values()) * small_sidecar.RECORD_BYTES,
++                    "seconds": build_seconds, "verified": True,
++                    "checkpoint_identity": identity,
++                    "manifest_identity": sidecar.manifest_identity,
++                    "validation_seconds": sidecar.validation_seconds,
++                    "validated_bytes": sidecar.validated_bytes,
++                }
++            finally:
++                sidecar.close()
++            record.write_text(json.dumps(summary, indent=1) + "\n")
++            print(json.dumps(summary))
++            return 0
++        finally:
++            store.close()
+     allocation = _slab_allocation(store, int(os.environ["FLASHNEXT_SLAB_GLOBAL"]), 32)
+     layers = sorted(int(layer) for layer in allocation)
+     if not layers:
+diff --git a/models/flashnext/tests/bench/replay_pool_policy.py b/models/flashnext/tests/bench/replay_pool_policy.py
+new file mode 100644
+index 0000000..fbb36ed
+--- /dev/null
++++ b/models/flashnext/tests/bench/replay_pool_policy.py
+@@ -0,0 +1,72 @@
++"""Offline validated-route replay through the production slot policy, not inference."""
++import argparse
++import hashlib
++import json
++from pathlib import Path
++from models.flashnext.expert_pool_policy import ExpertPoolPolicy, canonical_protected_fraction
++
++
++def replay(routes, capacity, initial, name, verify=False, free=None, protected_fraction=0.7):
++    policy = ExpertPoolPolicy(capacity, name, protected_fraction=protected_fraction)
++    if initial:
++        # Coverage records exact LRU ordering and ownership at prefill boundary.
++        for layer, expert, slot in initial:
++            policy.slot_of[layer, expert] = slot
++            if name == 'slru':
++                policy._probation[layer, expert] = None
++        occupied = set(policy.slot_of.values())
++        policy.free[:] = free if free is not None else [s for s in policy.free if s not in occupied]
++    total, per_token = 0, []
++    for index, route in enumerate(routes):
++        _, misses = policy.assign(route['layer'], route['experts'])
++        if verify and [list(pair) for pair in misses] != route['misses']:
++            raise ValueError(f'actual LRU slots/misses differ at route batch {index}')
++        total += len(misses)
++        if index % 47 == 0:
++            per_token.append(0)
++        per_token[-1] += len(misses)
++    return {'misses': total, 'requested_bytes': total * 3072000, 'misses_per_token': per_token,
++            'final_diagnostics': policy.diagnostics()}
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('input', type=Path)
++    parser.add_argument('--output', type=Path, required=True)
++    parser.add_argument('--slru-protected-fraction', type=canonical_protected_fraction, default=0.7)
++    args = parser.parse_args()
++    raw = args.input.read_bytes()
++    row = json.loads(raw)
++    if not row.get('validated') or row.get('runtime_cache_policy', 'lru') != 'lru':
++        raise ValueError('replay requires validated LRU coverage')
++    boundary = row['coverage']['boundary']
++    routes = row['coverage']['routes']
++    capacity = (row['effective_pool_bytes'] - 4096) // 3072000
++    initial = boundary['initial_slot_of']
++    if not routes or len(routes) != 47 * row['gen_tokens'] or any(
++            route['layer'] != index % 47 + 1 for index, route in enumerate(routes)):
++        raise ValueError('route trace does not cover actual 47-layer decode work')
++    if boundary['pool_created'] and capacity != boundary['initial_pool_capacity']:
++        raise ValueError('trace pool geometry mismatch')
++    if initial:
++        # No SLRU queue history can be recovered from an old LRU boundary.
++        raise ValueError('SLRU screening requires the validated empty prefill pool boundary')
++    lru = replay(routes, capacity, initial, 'lru', verify=True)
++    if lru['misses'] != row['pool_misses'] - boundary['misses']:
++        raise ValueError('LRU replay differs from actual decode miss counter')
++    slru = replay(routes, capacity, initial, 'slru', protected_fraction=args.slru_protected_fraction)
++    result = {'input': str(args.input), 'input_sha256': hashlib.sha256(raw).hexdigest(),
++              'production_policy_sha256': hashlib.sha256(Path(__import__(
++                  ExpertPoolPolicy.__module__, fromlist=['']).__file__).read_bytes()).hexdigest(),
++              'slru_protected_fraction': args.slru_protected_fraction,
++              'capacity': capacity, 'initial_entries': len(initial), 'route_batches': len(routes),
++              'actual_lru_matches_every_batch_and_slot': True, 'policies': {'lru': lru, 'slru': slru},
++              'miss_reduction_percent': (1 - slru['misses'] / lru['misses']) * 100,
++              'limitation': 'Offline miss counts on one validated route trace; no inference speed, quality, or deployment claim'}
++    args.output.write_text(json.dumps(result, indent=2) + '\n')
++    print(json.dumps({k: v for k, v in result.items() if k != 'policies'}))
++    print(json.dumps({name: value['misses'] for name, value in result['policies'].items()}))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/models/flashnext/tests/unit/test_expert_pool_policy.py b/models/flashnext/tests/unit/test_expert_pool_policy.py
+new file mode 100644
+index 0000000..8aad21e
+--- /dev/null
++++ b/models/flashnext/tests/unit/test_expert_pool_policy.py
+@@ -0,0 +1,122 @@
++"""Standalone real cache-policy tests; no MLX import or pool bypass."""
++import unittest
++from models.flashnext import expert_pool_policy as policy
++
++
++class PolicyTests(unittest.TestCase):
++    def make(self, capacity=4, name='slru'):
++        self.assertTrue(hasattr(policy, 'ExpertPoolPolicy'), 'bounded policy is missing')
++        return policy.ExpertPoolPolicy(capacity, name)
++
++    def consistent(self, p):
++        keys = set(p.slot_of)
++        self.assertEqual(len(set(p.slot_of.values())), len(keys))
++        self.assertEqual(set(p.slot_of.values()) | set(p.free), set(range(p.capacity)))
++        self.assertFalse(set(p.slot_of.values()) & set(p.free))
++        self.assertEqual(len(p.free), len(set(p.free)))
++        state = p.diagnostics()
++        self.assertLessEqual(state['protected_count'], int(p.protected_fraction * p.capacity))
++        self.assertEqual(state['probation_count'] + state['protected_count'], len(keys))
++
++    def test_promote_demote_and_probation_victim_order(self):
++        p = self.make()
++        first, _ = p.assign(1, [0, 1, 2, 3])
++        p.assign(1, [0, 1])
++        p.assign(1, [2])  # protected quota 2; 0 demotes to probation MRU
++        slots, misses = p.assign(1, [4])
++        self.assertEqual(misses, [(4, first[3])])
++        self.assertNotIn((1, 3), p.slot_of)
++        slots, misses = p.assign(1, [5])
++        self.assertEqual(misses, [(5, first[0])])
++        self.consistent(p)
++
++    def test_protects_mixed_hits_and_new_admissions_with_protected_fallback(self):
++        p = self.make(3)
++        first, _ = p.assign(1, [0, 1, 2])
++        p.assign(1, [0, 1])
++        slots, misses = p.assign(1, [2, 3, 4])
++        self.assertEqual(slots[2], first[2])
++        self.assertEqual(misses, [(3, first[0]), (4, first[1])])
++        self.assertEqual(set(p.slot_of), {(1, 2), (1, 3), (1, 4)})
++        self.consistent(p)
++
++    def test_capacity_one_protects_request_even_with_zero_protected_quota(self):
++        p = self.make(1)
++        p.assign(1, [0])
++        self.assertEqual(p.assign(1, [0]), ({0: 0}, []))
++        self.assertEqual(p.assign(1, [1]), ({1: 0}, [(1, 0)]))
++        self.consistent(p)
++
++    def test_oversize_rejected_before_any_hit_promotion_or_mutation(self):
++        p = self.make(2)
++        p.assign(1, [0, 1])
++        before = (list(p.slot_of.items()), list(p.free), p.diagnostics())
++        with self.assertRaisesRegex(ValueError, 'capacity'):
++            p.assign(1, [0, 1, 2])
++        self.assertEqual((list(p.slot_of.items()), list(p.free), p.diagnostics()), before)
++        self.assertEqual(p.assign(1, [0, 0]), ({0: 0}, []))
++
++    def test_invalidation_keeps_hits_without_restoring_evictions_and_frees_once(self):
++        p = self.make(3)
++        first, _ = p.assign(1, [0, 1, 2])
++        retained, misses = p.assign(1, [0, 3, 4])
++        p.assign(1, [3])  # invalidate must also remove a promoted incomplete entry
++        p.invalidate(1, misses)
++        p.invalidate(1, misses)
++        self.assertEqual(dict(p.slot_of), {(1, 0): first[0]})
++        self.assertEqual(retained[0], first[0])
++        self.consistent(p)
++        _, next_misses = p.assign(2, [0, 1])
++        self.assertEqual({slot for _, slot in next_misses}, {first[1], first[2]})
++        self.consistent(p)
++
++    def test_repeated_eviction_and_reuse_stays_bounded(self):
++        p = self.make(5)
++        for layer in range(200):
++            assigned, misses = p.assign(layer, [0, 1, 2, 3])
++            p.assign(layer, [1, 3])
++            self.assertEqual(len(set(assigned.values())), 4)
++            self.consistent(p)
++            self.assertLessEqual(len(p.diagnostics()['probation_oldest']), 8)
++
++    def test_lru_preserves_oldest_hit_first_admission(self):
++        p = self.make(name='lru')
++        first, _ = p.assign(1, [0, 1, 2, 3])
++        assigned, misses = p.assign(1, [0, 4, 5])
++        self.assertEqual(assigned[0], first[0])
++        self.assertEqual(misses, [(4, first[1]), (5, first[2])])
++
++    def test_fraction_is_finite_and_strictly_inside_unit_interval(self):
++        for value in (0, 1, -0.1, 1.1, float('nan'), float('inf'),
++                      float('-inf'), 'bad', '', None, True):
++            with self.subTest(value=value), self.assertRaises(ValueError):
++                policy.ExpertPoolPolicy(10, 'slru', protected_fraction=value)
++        with self.assertRaises(ValueError):
++            policy.ExpertPoolPolicy(10, 'lru', protected_fraction=0.5)
++
++    def test_half_fraction_exact_quota_demotions_and_victim_identity(self):
++        p = policy.ExpertPoolPolicy(5, 'slru', protected_fraction='0.5')
++        first, _ = p.assign(1, [0, 1, 2, 3, 4])
++        p.assign(1, [0, 1, 2])
++        self.assertEqual(p.protected_capacity, 2)
++        self.assertEqual(p.diagnostics()['protected_fraction'], 0.5)
++        self.assertEqual(p.diagnostics()['protected_oldest'], [(1, 1), (1, 2)])
++        self.assertEqual(p.diagnostics()['probation_oldest'], [(1, 3), (1, 4), (1, 0)])
++        self.assertEqual(p.assign(1, [3, 5, 6])[1], [(5, first[4]), (6, first[0])])
++        self.assertEqual(p.diagnostics()['protected_oldest'], [(1, 2), (1, 3)])
++        self.consistent(p)
++
++    def test_default_fraction_and_lru_behavior_remain_unchanged(self):
++        for name in ('lru', 'slru'):
++            p = policy.ExpertPoolPolicy(10, name)
++            self.assertEqual(p.protected_fraction, 0.7)
++            self.assertEqual(p.protected_capacity, 7)
++
++    def test_rejects_unknown_policy(self):
++        self.assertTrue(hasattr(policy, 'ExpertPoolPolicy'), 'bounded policy is missing')
++        with self.assertRaisesRegex(ValueError, 'policy'):
++            policy.ExpertPoolPolicy(4, 'typo')
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/models/flashnext/tests/unit/test_pool_policy_replay.py b/models/flashnext/tests/unit/test_pool_policy_replay.py
+new file mode 100644
+index 0000000..d1856ef
+--- /dev/null
++++ b/models/flashnext/tests/unit/test_pool_policy_replay.py
+@@ -0,0 +1,31 @@
++import unittest
++from models.flashnext.tests.bench import replay_pool_policy as replay
++
++
++class ReplayTests(unittest.TestCase):
++    def test_replays_real_policy_and_rejects_wrong_lru_trace(self):
++        self.assertTrue(hasattr(replay, 'replay'), 'production-policy replay is missing')
++        routes = [
++            {'layer': 1, 'experts': [0, 1, 2], 'misses': [[0, 0], [1, 1], [2, 2]]},
++            {'layer': 1, 'experts': [0, 3], 'misses': [[3, 1]]},
++            {'layer': 1, 'experts': [2, 4], 'misses': [[4, 0]]},
++        ]
++        self.assertEqual(replay.replay(routes, 3, [], 'lru', verify=True)['misses'], 5)
++        self.assertEqual(replay.replay(routes, 3, [], 'slru')['misses'], 5)
++        routes[-1]['misses'] = []
++        with self.assertRaisesRegex(ValueError, 'batch 2'):
++            replay.replay(routes, 3, [], 'lru', verify=True)
++
++    def test_initial_slot_mapping_and_free_order_are_preserved(self):
++        self.assertTrue(hasattr(replay, 'replay'), 'production-policy replay is missing')
++        routes = [{'layer': 1, 'experts': [8, 9], 'misses': [[9, 0]]}]
++        actual = replay.replay(routes, 3, [[1, 8, 2]], 'lru', verify=True, free=[1, 0])
++        self.assertEqual(actual['misses'], 1)
++
++    def test_replay_selects_half_fraction_on_production_class(self):
++        routes = [{'layer': 1, 'experts': [0, 1, 2, 3, 4]},
++                  {'layer': 1, 'experts': [0, 1, 2]}]
++        half = replay.replay(routes, 5, [], 'slru', protected_fraction=0.5)
++        self.assertEqual(half['final_diagnostics']['protected_capacity'], 2)
++        self.assertEqual(half['final_diagnostics']['protected_fraction'], 0.5)
++        self.assertEqual(replay.replay(routes, 5, [], 'slru')['final_diagnostics']['protected_capacity'], 3)
+diff --git a/models/flashnext/tests/unit/test_pool_slru.py b/models/flashnext/tests/unit/test_pool_slru.py
+new file mode 100644
+index 0000000..6e9faf9
+--- /dev/null
++++ b/models/flashnext/tests/unit/test_pool_slru.py
+@@ -0,0 +1,178 @@
++"""SLRU through the actual Metal-backed ExpertPool and checkpoint reads."""
++from concurrent.futures import ThreadPoolExecutor
++import os
++from types import SimpleNamespace
++import unittest
++from unittest import mock
++
++from models.flashnext import expert_pool, expert_cache
++from models.flashnext.expert_pool_policy import POLICY_FLAG, FRACTION_FLAG
++from . import test_pool_small_sidecar as fixtures
++
++PREFIX, SIDE_FLAG = fixtures.PREFIX, fixtures.SIDE_FLAG
++
++
++class SLRUTransactionTests(fixtures.TransactionTests):
++    def setUp(self):
++        with mock.patch.dict(os.environ, {POLICY_FLAG: 'slru'}):
++            super().setUp()
++        self.assertEqual(getattr(self.pool, 'cache_policy', None), 'slru')
++
++    def tearDown(self):
++        state = self.pool.policy_diagnostics()
++        self.assertEqual(state['probation_count'] + state['protected_count'], len(self.pool._slot_of))
++        self.assertEqual(set(self.pool._slot_of.values()) | set(self.pool._free), set(range(16)))
++        self.assertFalse(set(self.pool._slot_of.values()) & set(self.pool._free))
++
++
++class SLRUPoolTests(unittest.TestCase):
++    def test_real_row_fills_hits_and_repeated_eviction_reuse_both_io_modes(self):
++        import tempfile
++        with tempfile.TemporaryDirectory() as directory:
++            fixture = fixtures.Fixture(directory)
++            self.addCleanup(fixture.store.close)
++            fixture.build()
++            for side, fraction in (('', '0.7'), ('', '0.5'),
++                                   (str(fixture.out), '0.7'), (str(fixture.out), '0.5')):
++                with self.subTest(sidecar=bool(side), fraction=fraction), mock.patch.dict(os.environ, {
++                        POLICY_FLAG: 'slru', FRACTION_FLAG: fraction, SIDE_FLAG: side}):
++                    pool = expert_pool.ExpertPool(fixture.store, 4096 + 16 * 3072000)
++                    self.addCleanup(pool.close)
++                    self.assertEqual(getattr(pool, 'cache_policy', None), 'slru')
++                    with ThreadPoolExecutor(4) as workers:
++                        original, misses = pool.assign(4, [0, 1, 2])
++                        for future in pool.fill(PREFIX, misses, workers.submit):
++                            future.result()
++                        pool.assign(4, [1])
++                        pool.assign(9, list(range(13)))
++                        for expert in (4, 3, 2, 4):
++                            assigned, misses = pool.assign(4, [1, expert])
++                            for future in pool.fill(PREFIX, misses, workers.submit):
++                                future.result()
++                            self.assertEqual(assigned[1], original[1])
++                            for e, slot in assigned.items():
++                                for projection in ('gate_proj', 'up_proj', 'down_proj'):
++                                    for part in ('weight', 'scales', 'biases'):
++                                        row = fixture.expected[f'{PREFIX}.{projection}.{part}', e]
++                                        begin = 4096 + slot * 3072000 + pool.offsets[projection, part]
++                                        self.assertEqual(bytes(pool.array[begin:begin + len(row)]), row)
++                            state = pool.policy_diagnostics()
++                            self.assertEqual(state['probation_count'] + state['protected_count'], len(pool._slot_of))
++                            self.assertEqual(len(set(pool._slot_of.values())), len(pool._slot_of))
++
++    def test_actual_short_checkpoint_read_drains_before_invalidating_slru_slots(self):
++        import tempfile
++        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {
++                POLICY_FLAG: 'slru', FRACTION_FLAG: '0.5', SIDE_FLAG: '', 'FLASHNEXT_STREAM_PACK_CHUNK': '2'}):
++            fixture = fixtures.Fixture(directory)
++            self.addCleanup(fixture.store.close)
++            pool = expert_pool.ExpertPool(fixture.store, 4096 + 16 * 3072000)
++            self.addCleanup(pool.close)
++            self.assertEqual(getattr(pool, 'cache_policy', None), 'slru')
++            old, _ = pool.assign(4, [0])
++            # Original headers remain; actual checkpoint row reads now fail.
++            with open(os.path.join(directory, 'model.safetensors'), 'r+b') as shard:
++                shard.truncate(4096)
++            owner = SimpleNamespace(layer_id=4, hits=0, misses=0,
++                gate_proj=SimpleNamespace(group_size=32, cache=SimpleNamespace(
++                    store=fixture.store, prefix=PREFIX + '.gate_proj')))
++            submitted = []
++            with ThreadPoolExecutor(4) as workers:
++                def submit(fn, *args):
++                    future = workers.submit(fn, *args)
++                    submitted.append(future)
++                    return future
++                with mock.patch.object(expert_pool, 'for_store', return_value=pool), \
++                        mock.patch.object(expert_cache, '_submit_read', side_effect=submit), \
++                        mock.patch.object(expert_cache, '_KEEPWARM', [False]):
++                    with self.assertRaisesRegex(OSError, 'short expert pool read'):
++                        expert_cache.StreamingSwitchGLU._pool_pass(
++                            owner, None, [0, 1, 2], None, None, None, None, None)
++                self.assertTrue(submitted and all(f.done() for f in submitted))
++                self.assertEqual(dict(pool._slot_of), {(4, 0): old[0]})
++                state = pool.policy_diagnostics()
++                self.assertEqual((state['probation_count'], state['protected_count']), (0, 1))
++                self.assertEqual(len(pool._free), 15)
++                self.assertEqual(len(set(pool._free)), 15)
++
++    def test_startup_policy_validation_without_sidecar(self):
++        store = SimpleNamespace()
++        for value, gb, valid in (('slru', '6', True), ('lru', '6', True),
++                                 ('slru', '0', False), ('lru', '0', False),
++                                 ('typo', '6', False), ('typo', '0', False)):
++            with self.subTest(value=value, gb=gb), mock.patch.dict(os.environ, {
++                    POLICY_FLAG: value, expert_pool.SIZE_FLAG: gb, SIDE_FLAG: ''}):
++                if valid:
++                    expert_pool.initialize_sidecar(store)
++                    self.assertEqual(getattr(store, '_flashnext_pool_cache_policy', None), value)
++                else:
++                    with self.assertRaises(ValueError):
++                        expert_pool.initialize_sidecar(store)
++
++    def test_unset_startup_keeps_lru_even_with_pool_disabled(self):
++        store = SimpleNamespace()
++        with mock.patch.dict(os.environ, {expert_pool.SIZE_FLAG: '0', SIDE_FLAG: ''}):
++            os.environ.pop(POLICY_FLAG, None)
++            expert_pool.initialize_sidecar(store)
++            self.assertEqual(getattr(store, '_flashnext_pool_cache_policy', None), 'lru')
++            self.assertEqual(getattr(store, '_flashnext_pool_slru_protected_fraction', None), 0.7)
++
++    def test_fraction_override_validation_at_model_load_without_sidecar(self):
++        for value in ('0', '1', '-0.1', '1.1', 'nan', 'inf', '-inf', 'bad', ''):
++            with self.subTest(value=value), mock.patch.dict(os.environ, {
++                    POLICY_FLAG: 'slru', FRACTION_FLAG: value,
++                    expert_pool.SIZE_FLAG: '6', SIDE_FLAG: ''}):
++                with self.assertRaises(ValueError):
++                    expert_pool.initialize_sidecar(SimpleNamespace())
++        for name, gb in (('lru', '6'), ('', '6'), ('slru', '0')):
++            with self.subTest(policy=name, gb=gb), mock.patch.dict(os.environ, {
++                    POLICY_FLAG: name, FRACTION_FLAG: '0.5',
++                    expert_pool.SIZE_FLAG: gb, SIDE_FLAG: ''}):
++                with self.assertRaises(ValueError):
++                    expert_pool.initialize_sidecar(SimpleNamespace())
++        for value in ('0.5', '0.7'):
++            store = SimpleNamespace()
++            with mock.patch.dict(os.environ, {POLICY_FLAG: 'slru', FRACTION_FLAG: value,
++                    expert_pool.SIZE_FLAG: '6', SIDE_FLAG: ''}):
++                expert_pool.initialize_sidecar(store)
++            self.assertEqual(store._flashnext_pool_slru_protected_fraction, float(value))
++
++    def test_actual_constructor_rejects_invalid_or_lru_fraction_before_allocation(self):
++        for name, value in (('slru', 'nan'), ('slru', ''), ('lru', '0.5'), ('lru', '0.7')):
++            with self.subTest(policy=name, fraction=value), mock.patch.dict(os.environ, {
++                    POLICY_FLAG: name, FRACTION_FLAG: value, SIDE_FLAG: ''}):
++                with self.assertRaises(ValueError):
++                    expert_pool.ExpertPool(SimpleNamespace(dir='/absent', refs={}), 4096 + 16 * 3072000)
++
++    def test_half_fraction_real_pool_publishes_actual_quota_and_shared_aliases(self):
++        with mock.patch.dict(os.environ, {POLICY_FLAG: 'slru', FRACTION_FLAG: '0.5', SIDE_FLAG: ''}):
++            pool = expert_pool.ExpertPool(SimpleNamespace(dir='/absent', refs={}), 4096 + 16 * 3072000)
++        self.addCleanup(pool.close)
++        self.assertEqual(pool.slru_protected_fraction, 0.5)
++        self.assertEqual(pool.policy_diagnostics()['protected_fraction'], 0.5)
++        self.assertEqual(pool.policy_diagnostics()['protected_capacity'], 8)
++        self.assertIs(pool._slot_of, pool._policy.slot_of)
++        self.assertIs(pool._free, pool._policy.free)
++        pool.assign(1, list(range(16)))
++        pool.assign(1, list(range(9)))
++        self.assertEqual(pool.policy_diagnostics()['protected_count'], 8)
++
++    def test_oversize_actual_pool_request_is_atomic(self):
++        with mock.patch.dict(os.environ, {POLICY_FLAG: 'slru', SIDE_FLAG: ''}):
++            pool = expert_pool.ExpertPool(SimpleNamespace(dir='/absent', refs={}), 4096 + 16 * 3072000)
++        self.addCleanup(pool.close)
++        self.assertEqual(getattr(pool, 'cache_policy', None), 'slru')
++        pool.assign(4, [0, 1])
++        before = (list(pool._slot_of.items()), list(pool._free), pool.hits, pool.misses, pool.policy_diagnostics())
++        with self.assertRaisesRegex(ValueError, 'capacity'):
++            pool.assign(4, list(range(17)))
++        self.assertEqual((list(pool._slot_of.items()), list(pool._free), pool.hits, pool.misses, pool.policy_diagnostics()), before)
++
++
++class HalfSLRUTransactionTests(SLRUTransactionTests):
++    def setUp(self):
++        self.fraction_environment = mock.patch.dict(os.environ, {FRACTION_FLAG: '0.5'})
++        self.fraction_environment.start()
++        self.addCleanup(self.fraction_environment.stop)
++        super().setUp()
++        self.assertEqual(self.pool.slru_protected_fraction, 0.5)
+diff --git a/models/flashnext/tests/unit/test_pool_small_sidecar.py b/models/flashnext/tests/unit/test_pool_small_sidecar.py
+new file mode 100644
+index 0000000..67a11ce
+--- /dev/null
++++ b/models/flashnext/tests/unit/test_pool_small_sidecar.py
+@@ -0,0 +1,776 @@
++"""Pool sidecar geometry, byte placement, startup and failure transactions."""
++from __future__ import annotations
++
++from concurrent.futures import ThreadPoolExecutor
++import hashlib
++import json
++import os
++from pathlib import Path
++import struct
++import subprocess
++import sys
++import tempfile
++import threading
++from types import SimpleNamespace
++import unittest
++from unittest import mock
++
++from models.flashnext import expert_cache, expert_pool, small_sidecar
++from models.flashnext.slab_pack import get_slab_layout
++from models.flashnext.store import SafeTensorStore
++
++PREFIX = "language_model.model.layers.4.mlp.switch_mlp"
++EXPERTS = 5
++SIDE_FLAG = "FLASHNEXT_EXPERT_POOL_SMALL_SIDECAR"
++
++
++class Fixture:
++    """Real, typed safetensors with hand-chosen, expert-distinct row bytes."""
++    def __init__(self, directory):
++        self.directory = Path(directory)
++        header, payload = {}, bytearray()
++        shapes = {"gate_proj": ((640, 320), (640, 80)),
++                  "up_proj": ((640, 320), (640, 80)),
++                  "down_proj": ((2560, 80), (2560, 20))}
++        self.expected = {}
++        for projection_index, (projection, tails) in enumerate(shapes.items()):
++            for part_index, part in enumerate(("weight", "scales", "biases")):
++                size = 819200 if part == "weight" else 102400
++                name = f"{PREFIX}.{projection}.{part}"
++                begin = len(payload)
++                for expert in range(EXPERTS):
++                    row = bytes([1 + 20 * expert + 3 * projection_index + part_index]) * size
++                    self.expected[name, expert] = row
++                    payload.extend(row)
++                header[name] = {"dtype": "U32" if part == "weight" else "BF16",
++                                "shape": [EXPERTS, *tails[part != "weight"]],
++                                "data_offsets": [begin, len(payload)]}
++        raw = json.dumps(header).encode()
++        shard = "model.safetensors"
++        (self.directory / shard).write_bytes(struct.pack("<Q", len(raw)) + raw + payload)
++        (self.directory / "model.safetensors.index.json").write_text(json.dumps({
++            "weight_map": {name: shard for name in header}}))
++        self.store = SafeTensorStore(str(self.directory))
++        self.out = self.directory / "sidecar"
++
++    def build(self):
++        return small_sidecar.build_pool(self.store, self.out)
++
++    def pool(self):
++        with mock.patch.dict(os.environ, {SIDE_FLAG: str(self.out)}):
++            return expert_pool.ExpertPool(self.store, 4096 + 16 * 3072000)
++
++    def manifest(self):
++        return json.loads((self.out / "manifest.json").read_text())
++
++    def replace_manifest(self, manifest):
++        path = self.out / "manifest.json"
++        path.chmod(0o600)
++        path.write_text(json.dumps(manifest))
++        path.chmod(0o444)
++
++
++class SidecarTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.fixture = Fixture(self.temp.name)
++        self.addCleanup(self.temp.cleanup)
++        self.addCleanup(self.fixture.store.close)
++
++    def test_scatter_matches_all_nine_fields_with_header_and_noncontiguous_slots(self):
++        self.fixture.build()
++        pool = self.fixture.pool()
++        self.addCleanup(pool.close)
++        pool.array[:] = 0xE7
++        pool.assign(4, [0, 1, 2])
++        slots, misses = pool.assign(4, [0, 3, 2, 4])
++        self.assertEqual(misses, [(3, 3), (4, 4)])
++        # Include the previously assigned slots to exercise an arbitrary list.
++        misses = [(4, 4), (0, 0), (2, 2)]
++        with ThreadPoolExecutor(2) as workers:
++            for future in pool.fill(PREFIX, misses, workers.submit):
++                future.result()
++        self.assertEqual(bytes(pool.array[:4096]), b"\xe7" * 4096)
++        self.assertEqual(bytes(pool.array[4096 + 3072000:4096 + 2 * 3072000]),
++                         b"\xe7" * 3072000)
++        for expert, slot in misses:
++            for projection in ("gate_proj", "up_proj", "down_proj"):
++                for part in ("weight", "scales", "biases"):
++                    name = f"{PREFIX}.{projection}.{part}"
++                    row = self.fixture.expected[name, expert]
++                    begin = 4096 + slot * 3072000 + pool.offsets[projection, part]
++                    self.assertEqual(bytes(pool.array[begin:begin + len(row)]), row)
++        self.assertIsNotNone(pool.sidecar)
++        self.assertEqual(pool.sidecar.validated_bytes, 3072000)
++        self.assertGreaterEqual(pool.sidecar.validation_seconds, 0)
++
++    def test_sidecar_hit_eviction_and_reused_slot_keep_the_exact_row_bytes(self):
++        self.fixture.build()
++        pool = self.fixture.pool()
++        self.addCleanup(pool.close)
++        first, misses = pool.assign(4, [0, 1, 2])
++        with ThreadPoolExecutor(2) as workers:
++            for future in pool.fill(PREFIX, misses, workers.submit):
++                future.result()
++            hit, none = pool.assign(4, [1])
++            self.assertEqual(none, [])
++            self.assertEqual(hit[1], first[1])
++            self.assertEqual(pool.fill(PREFIX, none, workers.submit), [])
++            # Fill the remaining slots with older mappings from another layer;
++            # the next new expert must reuse the original oldest slot.
++            pool.assign(9, list(range(13)))
++            reused, misses = pool.assign(4, [1, 4])
++            self.assertEqual(misses, [(4, first[0])])
++            for future in pool.fill(PREFIX, misses, workers.submit):
++                future.result()
++        self.assertNotIn((4, 0), pool._slot_of)
++        self.assertEqual(reused[1], first[1])
++        for expert in (1, 4):
++            base = 4096 + reused[expert] * 3072000
++            for projection in ("gate_proj", "up_proj", "down_proj"):
++                for part in ("weight", "scales", "biases"):
++                    row = self.fixture.expected[f"{PREFIX}.{projection}.{part}", expert]
++                    begin = base + pool.offsets[projection, part]
++                    self.assertEqual(bytes(pool.array[begin:begin + len(row)]), row)
++
++    def test_fill_uses_four_reads_per_miss_and_same_validated_readonly_fd(self):
++        self.fixture.build()
++        pool = self.fixture.pool()
++        self.addCleanup(pool.close)
++        fd = pool.sidecar.fd(4)
++        with self.assertRaises(OSError):
++            os.pwrite(fd, b"!", 0)
++        # Rename and replace the pathname after validation; retained FD must
++        # still read the validated original inode, never reopen the pathname.
++        path = small_sidecar.layer_path(self.fixture.out, 4)
++        path.rename(path.with_suffix(".old"))
++        path.write_bytes(b"!" * (EXPERTS * 614400))
++        path.chmod(0o444)
++        calls = []
++        native = os.preadv
++        def read(read_fd, targets, offset):
++            calls.append((read_fd, sum(map(len, targets)), offset))
++            return native(read_fd, targets, offset)
++        proxy = SimpleNamespace(**{key: getattr(os, key) for key in dir(os)})
++        proxy.preadv = read
++        with mock.patch.object(expert_pool, "os", proxy), \
++                mock.patch.object(small_sidecar, "os", proxy), ThreadPoolExecutor(2) as workers:
++            for future in pool.fill(PREFIX, [(3, 7)], workers.submit):
++                future.result()
++        self.assertEqual(sorted(size for _, size, _ in calls), [614400, 819200, 819200, 819200])
++        self.assertIn((fd, 614400, 3 * 614400), calls)
++        start = 4096 + 7 * 3072000 + 819200
++        self.assertEqual(bytes(pool.array[start:start + 102400]),
++                         self.fixture.expected[f"{PREFIX}.gate_proj.scales", 3])
++
++    def test_feature_off_keeps_original_nine_reads(self):
++        with mock.patch.dict(os.environ, {SIDE_FLAG: ""}):
++            pool = expert_pool.ExpertPool(self.fixture.store, 4096 + 16 * 3072000)
++        self.addCleanup(pool.close)
++        calls = []
++        native = os.preadv
++        proxy = SimpleNamespace(**{key: getattr(os, key) for key in dir(os)})
++        def read(fd, targets, offset):
++            calls.append(sum(map(len, targets)))
++            return native(fd, targets, offset)
++        proxy.preadv = read
++        with mock.patch.object(expert_pool, "os", proxy), ThreadPoolExecutor(2) as workers:
++            for future in pool.fill(PREFIX, [(1, 3)], workers.submit):
++                future.result()
++        self.assertIsNone(pool.sidecar)
++        self.assertEqual(sorted(calls), [102400] * 6 + [819200] * 3)
++
++    def test_pool_metadata_uses_one_preadv_with_three_paired_gaps(self):
++        self.fixture.build()
++        pool = self.fixture.pool()
++        self.addCleanup(pool.close)
++        native = os.preadv
++        spans = []
++        proxy = SimpleNamespace(**{key: getattr(os, key) for key in dir(os)})
++        def read(fd, targets, offset):
++            spans.append([len(target) for target in targets])
++            return native(fd, targets, offset)
++        proxy.preadv = read
++        with mock.patch.object(small_sidecar, "os", proxy):
++            pool.sidecar.read_into_slots(4, [(0, 10)], pool._view, get_slab_layout(32))
++        self.assertEqual(spans, [[204800, 204800, 204800]])
++
++    def test_wrong_group_is_rejected(self):
++        self.fixture.build()
++        with mock.patch.dict(os.environ, {SIDE_FLAG: str(self.fixture.out)}):
++            with self.assertRaisesRegex(ValueError, "Q4/G32"):
++                expert_pool.ExpertPool(self.fixture.store, 4096 + 16 * 3072000, 64)
++
++    def test_manifest_mismatches_fail_before_pool_allocation(self):
++        self.fixture.build()
++        original = self.fixture.manifest()
++        mutations = [
++            ("format", "other"), ("checkpoint_identity", "other"),
++            ("layers", [1, 4]), ("record_bytes", 1), ("group_size", 64),
++            ("experts", {"4": 4}), ("files", {}), ("layout", {}),
++        ]
++        for field, value in mutations:
++            with self.subTest(field=field):
++                manifest = dict(original, **{field: value})
++                self.fixture.replace_manifest(manifest)
++                with mock.patch.object(expert_pool.mmap, "mmap", side_effect=AssertionError("allocated")):
++                    with self.assertRaises(ValueError):
++                        self.fixture.pool()
++        self.fixture.replace_manifest(original)
++
++    def test_tensor_geometry_and_dtype_rejected(self):
++        self.fixture.build()
++        name = f"{PREFIX}.down_proj.weight"
++        ref = self.fixture.store.refs[name]
++        for field, bad in (("shape", (EXPERTS, 80, 2560)), ("dtype", "F32"), ("row_bytes", 42)):
++            with self.subTest(field=field):
++                previous = getattr(ref, field)
++                setattr(ref, field, bad)
++                try:
++                    with self.assertRaises(ValueError):
++                        self.fixture.pool()
++                finally:
++                    setattr(ref, field, previous)
++
++    def test_config_declared_layers_and_experts_must_match_refs(self):
++        self.fixture.build()
++        path = self.fixture.directory / "config.json"
++        for config in ({"num_hidden_layers": 48, "num_experts": 512},
++                       {"num_hidden_layers": 5, "num_experts": 5}):
++            with self.subTest(config=config):
++                path.write_text(json.dumps({"text_config": config}))
++                with self.assertRaises(ValueError):
++                    self.fixture.pool()
++        path.unlink()
++
++    def test_declared_quantization_must_agree_with_q4_g32_refs(self):
++        self.fixture.build()
++        path = self.fixture.directory / "config.json"
++        for field, value in (("bits", 8), ("group_size", 64), ("mode", "mxfp4")):
++            with self.subTest(field=field):
++                quantization = {"bits": 4, "group_size": 32, "mode": "affine"}
++                quantization[field] = value
++                path.write_text(json.dumps({"quantization": quantization}))
++                with self.assertRaises(ValueError):
++                    self.fixture.pool()
++        path.unlink()
++
++    def test_real_checkpoint_geometry_requires_all_47_pool_layers_and_512_experts(self):
++        original = self.fixture.store.refs
++        refs = {}
++        for layer in range(48):
++            for name, ref in original.items():
++                refs[name.replace("layers.4.", f"layers.{layer}.")] = SimpleNamespace(
++                    dtype=ref.dtype, row_bytes=ref.row_bytes, shape=(512, *ref.shape[1:]))
++        self.fixture.store.refs = refs
++        path = self.fixture.directory / "config.json"
++        path.write_text(json.dumps({"text_config": {"num_hidden_layers": 48, "num_experts": 512}}))
++        prefixes, experts, _ = small_sidecar._pool_contract(self.fixture.store, get_slab_layout(32))
++        self.assertEqual(set(prefixes), set(range(1, 48)))
++        self.assertEqual(experts, {layer: 512 for layer in range(1, 48)})
++        del refs["language_model.model.layers.47.mlp.switch_mlp.down_proj.biases"]
++        with self.assertRaises(ValueError):
++            small_sidecar._pool_contract(self.fixture.store, get_slab_layout(32))
++        self.fixture.store.refs = original
++
++    def test_all_pool_layers_are_required_and_layer_zero_is_excluded(self):
++        self.fixture.build()
++        refs = self.fixture.store.refs
++        for name, ref in list(refs.items()):
++            refs[name.replace("layers.4.", "layers.0.")] = ref
++        pool = self.fixture.pool()
++        self.assertEqual(pool.sidecar.layers, {4})
++        pool.close()
++        for name, ref in list(refs.items()):
++            if "layers.4." in name:
++                refs[name.replace("layers.4.", "layers.6.")] = ref
++        with self.assertRaises(ValueError):
++            self.fixture.pool()
++
++    def test_wrong_size_same_size_corruption_and_writable_payload_rejected(self):
++        self.fixture.build()
++        path = small_sidecar.layer_path(self.fixture.out, 4)
++        original = path.read_bytes()
++        for content, mode in ((original[:-1], 0o444),
++                              (b"!" + original[1:], 0o444),
++                              (original, 0o644)):
++            with self.subTest(size=len(content), mode=mode):
++                path.chmod(0o600)
++                path.write_bytes(content)
++                path.chmod(mode)
++                with self.assertRaises(ValueError):
++                    self.fixture.pool()
++        path.chmod(0o600)
++        path.write_bytes(original)
++        path.chmod(0o444)
++
++    def test_hash_uses_bounded_reads_on_runtime_nocache_fd(self):
++        self.fixture.build()
++        native = os.pread
++        reads = []
++        policies = []
++        native_fcntl = small_sidecar.fcntl.fcntl
++        proxy = SimpleNamespace(**{key: getattr(os, key) for key in dir(os)})
++        def read(fd, size, offset):
++            reads.append((fd, size))
++            return native(fd, size, offset)
++        def policy(fd, command, value):
++            policies.append((fd, command, value))
++            return native_fcntl(fd, command, value)
++        proxy.pread = read
++        with mock.patch.object(small_sidecar, "os", proxy), \
++                mock.patch.object(small_sidecar.fcntl, "fcntl", side_effect=policy):
++            pool = self.fixture.pool()
++        self.addCleanup(pool.close)
++        fd = pool.sidecar.fd(4)
++        self.assertTrue(reads)
++        self.assertEqual({read_fd for read_fd, _ in reads}, {fd})
++        self.assertLessEqual(max(size for _, size in reads), 1048576)
++        self.assertIn((fd, small_sidecar.fcntl.F_NOCACHE, 1), policies)
++        self.assertIn((fd, getattr(small_sidecar.fcntl, "F_RDAHEAD", 45), 0), policies)
++
++    def test_nocache_failure_closes_opened_fd(self):
++        self.fixture.build()
++        opened = []
++        native = os.open
++        proxy = SimpleNamespace(**{key: getattr(os, key) for key in dir(os)})
++        def open_file(*args):
++            fd = native(*args)
++            opened.append(fd)
++            return fd
++        proxy.open = open_file
++        with mock.patch.object(small_sidecar, "os", proxy), \
++                mock.patch.object(small_sidecar.fcntl, "fcntl", side_effect=OSError("nocache")):
++            with self.assertRaises(OSError):
++                self.fixture.pool()
++        self.assertTrue(opened)
++        for fd in opened:
++            with self.assertRaises(OSError):
++                os.fstat(fd)
++
++    def test_startup_validation_is_cached_and_store_close_closes_it(self):
++        self.fixture.build()
++        with mock.patch.dict(os.environ, {SIDE_FLAG: str(self.fixture.out), expert_pool.SIZE_FLAG: "6"}):
++            first = expert_pool.initialize_sidecar(self.fixture.store)
++            with mock.patch.object(small_sidecar, "_hash_fd", side_effect=AssertionError("rehash")):
++                pool = self.fixture.pool()
++        self.assertIs(pool.sidecar, first)
++        fd = first.fd(4)
++        self.fixture.store.close()
++        with self.assertRaises(OSError):
++            os.fstat(fd)
++        pool.close()
++
++    def test_builder_never_truncates_existing_assets(self):
++        self.fixture.out.mkdir()
++        sentinel = self.fixture.out / "layer-04.bin"
++        sentinel.write_bytes(b"keep")
++        with self.assertRaises(FileExistsError):
++            self.fixture.build()
++        self.assertEqual(sentinel.read_bytes(), b"keep")
++
++    def test_builder_failure_removes_private_stage_without_publishing(self):
++        native = os.pwrite
++        count = [0]
++        proxy = SimpleNamespace(**{key: getattr(os, key) for key in dir(os)})
++        def short_write(fd, data, offset):
++            count[0] += 1
++            return native(fd, data[:-1], offset)
++        proxy.pwrite = short_write
++        with mock.patch.object(small_sidecar, "os", proxy):
++            with self.assertRaises(OSError):
++                self.fixture.build()
++        self.assertGreater(count[0], 0)
++        self.assertFalse(self.fixture.out.exists())
++        self.assertEqual(list(self.fixture.directory.glob(".sidecar-*")), [])
++
++    def test_builder_comparison_failure_cannot_publish_a_manifest(self):
++        native = os.pread
++        proxy = SimpleNamespace(**{key: getattr(os, key) for key in dir(os)})
++        def corrupt(fd, size, offset):
++            data = native(fd, size, offset)
++            if size == 614400:
++                return b"!" + data[1:]
++            return data
++        proxy.pread = corrupt
++        with mock.patch.object(small_sidecar, "os", proxy):
++            with self.assertRaisesRegex(ValueError, "record differs"):
++                self.fixture.build()
++        self.assertFalse(self.fixture.out.exists())
++        self.assertEqual(list(self.fixture.directory.glob(".sidecar-*")), [])
++
++    def test_builder_checkpoint_mutation_cannot_publish(self):
++        native = small_sidecar.build
++        def changed(*args):
++            written = native(*args)
++            path = self.fixture.directory / "model.safetensors"
++            value = path.stat()
++            os.utime(path, ns=(value.st_atime_ns, value.st_mtime_ns + 1000000))
++            return written
++        with mock.patch.object(small_sidecar, "build", side_effect=changed):
++            with self.assertRaisesRegex(ValueError, "checkpoint changed"):
++                self.fixture.build()
++        self.assertFalse(self.fixture.out.exists())
++        self.assertEqual(list(self.fixture.directory.glob(".sidecar-*")), [])
++
++    def test_builder_publication_includes_verified_manifest_and_readonly_payload(self):
++        written = self.fixture.build()
++        self.assertEqual(written, {4: EXPERTS})
++        manifest = self.fixture.manifest()
++        path = small_sidecar.layer_path(self.fixture.out, 4)
++        expected = b"".join(self.fixture.expected[f"{PREFIX}.{projection}.{part}", expert]
++                            for expert in range(EXPERTS)
++                            for projection, part in small_sidecar.PARTS)
++        self.assertEqual(path.read_bytes(), expected)
++        self.assertEqual(manifest["files"]["4"]["sha256"], hashlib.sha256(expected).hexdigest())
++        self.assertEqual(manifest["files"]["4"]["size"], 3072000)
++        self.assertEqual(path.stat().st_mode & 0o222, 0)
++        self.assertEqual(list(self.fixture.directory.glob(".sidecar-*")), [])
++
++    def test_pool_builder_cli_reports_manifest_identity_size_and_validation_duration(self):
++        results = Path(__file__).resolve().parents[4] / "results"
++        results.mkdir(exist_ok=True)
++        reports = tempfile.TemporaryDirectory(prefix="pool-sidecar-unit-", dir=results)
++        self.addCleanup(reports.cleanup)
++        report = Path(reports.name) / "build.json"
++        run = subprocess.run([
++            sys.executable, "-m", "models.flashnext.tests.bench.build_small_sidecar",
++            "--pool", "--checkpoint", str(self.fixture.directory),
++            "--out", str(self.fixture.out), "--report", str(report),
++        ], capture_output=True, text=True)
++        self.assertEqual(run.returncode, 0, run.stderr)
++        summary = json.loads(run.stdout)
++        self.assertEqual(summary["layers"], [4])
++        self.assertEqual(summary["bytes"], 3072000)
++        self.assertEqual(summary["validated_bytes"], 3072000)
++        self.assertGreaterEqual(summary["validation_seconds"], 0)
++        self.assertEqual(summary["manifest_identity"], hashlib.sha256(
++            (self.fixture.out / "manifest.json").read_bytes()).hexdigest())
++        self.assertEqual(json.loads(report.read_text()), summary)
++
++    def test_startup_rejects_sidecar_configuration_when_pool_is_disabled(self):
++        self.fixture.build()
++        with mock.patch.dict(os.environ, {SIDE_FLAG: str(self.fixture.out), expert_pool.SIZE_FLAG: "0"}):
++            with self.assertRaises(ValueError):
++                expert_pool.initialize_sidecar(self.fixture.store)
++
++    def test_loader_rejects_bad_sidecar_before_constructing_model_and_closes_fds(self):
++        from models.flashnext import loader
++
++        self.fixture.build()
++        path = small_sidecar.layer_path(self.fixture.out, 4)
++        path.chmod(0o644)
++        opened = []
++        native = os.open
++        proxy = SimpleNamespace(**{key: getattr(os, key) for key in dir(os)})
++        def open_file(*args):
++            fd = native(*args)
++            opened.append(fd)
++            return fd
++        proxy.open = open_file
++        with mock.patch.dict(os.environ, {SIDE_FLAG: str(self.fixture.out), expert_pool.SIZE_FLAG: "6"}), \
++                mock.patch.object(small_sidecar, "os", proxy), \
++                mock.patch.object(loader, "get_model_and_args", side_effect=AssertionError("model constructed")):
++            with self.assertRaisesRegex(ValueError, "readonly"):
++                loader.load_streaming(str(self.fixture.directory), verbose=False)
++        self.assertTrue(opened)
++        for fd in opened:
++            with self.assertRaises(OSError):
++                os.fstat(fd)
++
++    def test_metadata_mutation_during_digest_validation_is_rejected(self):
++        self.fixture.build()
++        native = small_sidecar._hash_fd
++        path = small_sidecar.layer_path(self.fixture.out, 4)
++        def changed(fd, size):
++            digest = native(fd, size)
++            value = path.stat()
++            os.utime(path, ns=(value.st_atime_ns, value.st_mtime_ns + 1000000))
++            return digest
++        with mock.patch.object(small_sidecar, "_hash_fd", side_effect=changed):
++            with self.assertRaisesRegex(ValueError, "changed during validation"):
++                self.fixture.pool()
++
++    def test_manifest_path_and_digest_must_match_each_payload(self):
++        self.fixture.build()
++        original = self.fixture.manifest()
++        for field, value in (("path", "../other.bin"), ("sha256", "bad"), ("size", 1)):
++            with self.subTest(field=field):
++                changed = json.loads(json.dumps(original))
++                changed["files"]["4"][field] = value
++                self.fixture.replace_manifest(changed)
++                with self.assertRaises(ValueError):
++                    self.fixture.pool()
++
++    def test_short_sidecar_read_raises(self):
++        self.fixture.build()
++        pool = self.fixture.pool()
++        self.addCleanup(pool.close)
++        proxy = SimpleNamespace(**{key: getattr(os, key) for key in dir(os)})
++        proxy.preadv = lambda *_: 614399
++        with mock.patch.object(small_sidecar, "os", proxy):
++            with self.assertRaises(OSError):
++                pool.sidecar.read_into_slots(4, [(1, 5)], pool._view, get_slab_layout(32))
++
++
++class _InterruptedWait:
++    """Interrupt one wait; completion always belongs to the real Future."""
++    def __init__(self, future, interrupted):
++        self.future = future
++        self.interrupted = interrupted
++        self.once = True
++
++    def result(self):
++        if self.once:
++            self.once = False
++            self.interrupted.set()
++            raise KeyboardInterrupt("interrupted result wait")
++        return self.future.result()
++
++    def done(self):
++        return self.future.done()
++
++
++class TransactionTests(unittest.TestCase):
++    def setUp(self):
++        with mock.patch.dict(os.environ, {SIDE_FLAG: ""}):
++            self.pool = expert_pool.ExpertPool(SimpleNamespace(dir="/absent", refs={}),
++                                              4096 + 16 * 3072000)
++        self.addCleanup(self.pool.close)
++
++    def test_invalidation_retains_old_hits_and_does_not_restore_evicted_mapping(self):
++        old, _ = self.pool.assign(4, list(range(16)))
++        slots, misses = self.pool.assign(4, [7, 20, 21])
++        self.assertEqual({slot for _, slot in misses}, {old[0], old[1]})
++        self.pool.invalidate(4, misses)
++        self.pool.invalidate(4, misses)
++        self.assertEqual(len(self.pool._free), 2)
++        self.assertEqual(len(set(self.pool._free)), 2)
++        again, new = self.pool.assign(4, [7, 0, 20])
++        self.assertEqual(again[7], old[7])
++        self.assertEqual({expert for expert, _ in new}, {0, 20})
++        self.assertEqual(len(set(self.pool._slot_of.values())), len(self.pool._slot_of))
++
++    def test_invalid_chunk_configuration_invalidates_unfilled_new_slots(self):
++        owner = SimpleNamespace(layer_id=4, hits=0, misses=0,
++                                gate_proj=SimpleNamespace(group_size=32, cache=SimpleNamespace(
++                                    store=self.pool.store, prefix=PREFIX + ".gate_proj")))
++        with mock.patch.dict(os.environ, {"FLASHNEXT_STREAM_PACK_CHUNK": "invalid"}), \
++                mock.patch.object(expert_pool, "for_store", return_value=self.pool):
++            with self.assertRaises(ValueError):
++                expert_cache.StreamingSwitchGLU._pool_pass(
++                    owner, None, [0, 1], None, None, None, None, None)
++        self.assertEqual(self.pool._slot_of, {})
++        self.assertEqual(len(self.pool._free), 16)
++        self.assertEqual(len(set(self.pool._free)), 16)
++
++    def run_interrupted_failure_drain(self, submit_failure):
++        old, _ = self.pool.assign(4, [3])
++        started, release, interrupted = threading.Event(), threading.Event(), threading.Event()
++        finished, write_done = threading.Event(), threading.Event()
++        futures, errors, invalidations = [], [], []
++        owner = SimpleNamespace(layer_id=4, hits=0, misses=0,
++                                gate_proj=SimpleNamespace(group_size=32, cache=SimpleNamespace(
++                                    store=self.pool.store, prefix=PREFIX + ".gate_proj")))
++        primary = RuntimeError("submit failed" if submit_failure else "warm failed")
++        # These are actual background writes into the actual pool buffer.
++        # Only waiting is adapted: every completion/done state is a real Future.
++        def write(first):
++            if first:
++                started.set()
++                if not release.wait(2):
++                    raise AssertionError("test writer release timed out")
++                self.pool._view[4096 + 3072000] = 0x6A
++                write_done.set()
++                raise KeyboardInterrupt("completed worker error")
++        with ThreadPoolExecutor(1) as workers:
++            count = [0]
++            def submit(function, *args):
++                count[0] += 1
++                if submit_failure and count[0] == 2:
++                    raise primary
++                future = workers.submit(write, count[0] == 1)
++                futures.append(future)
++                return _InterruptedWait(future, interrupted)
++            def warm(_):
++                if not started.wait(1):
++                    raise AssertionError("test writer did not start")
++                raise primary
++            native = self.pool.invalidate
++            def invalidate(layer, misses):
++                invalidations.append((write_done.is_set(), all(future.done() for future in futures)))
++                native(layer, misses)
++            def execute():
++                try:
++                    expert_cache.StreamingSwitchGLU._pool_pass(
++                        owner, None, [3, 0, 1], None, None, None, None, None)
++                except BaseException as error:
++                    errors.append(error)
++                finally:
++                    finished.set()
++            with mock.patch.object(expert_pool, "for_store", return_value=self.pool), \
++                    mock.patch.object(expert_cache, "_submit_read", side_effect=submit), \
++                    mock.patch.object(expert_cache, "_KEEPWARM", [not submit_failure]), \
++                    mock.patch.object(expert_cache, "_keep_gpu_warm_until", side_effect=warm), \
++                    mock.patch.object(self.pool, "invalidate", side_effect=invalidate):
++                thread = threading.Thread(target=execute)
++                thread.start()
++                try:
++                    self.assertTrue(started.wait(1))
++                    self.assertTrue(interrupted.wait(1))
++                    premature_return = finished.wait(0.02)
++                    early_invalidations = list(invalidations)
++                    early_slots = dict(self.pool._slot_of)
++                    early_free = list(self.pool._free)
++                    running = futures[0].running()
++                finally:
++                    release.set()
++                    thread.join(2)
++        self.assertFalse(premature_return, "transaction escaped interrupted wait before writer completed")
++        self.assertEqual(early_invalidations, [])
++        self.assertTrue(running)
++        self.assertEqual(set(early_slots), {(4, 3), (4, 0), (4, 1)})
++        self.assertEqual(len(early_free), 13, "new slots were reusable before writer completed")
++        self.assertFalse(thread.is_alive())
++        self.assertEqual(invalidations, [(True, True)])
++        self.assertEqual(errors, [primary], "drain replaced the primary transaction error")
++        self.assertEqual(self.pool._slot_of, {(4, 3): old[3]})
++        self.assertEqual(len(self.pool._free), 15)
++        self.assertEqual(len(set(self.pool._free)), 15)
++        self.assertEqual(self.pool._view[4096 + 3072000], 0x6A)
++
++    def test_interrupted_partial_submit_drain_retains_slots_until_writes_finish(self):
++        self.run_interrupted_failure_drain(submit_failure=True)
++
++    def test_interrupted_keepwarm_failure_drain_retains_slots_until_writes_finish(self):
++        self.run_interrupted_failure_drain(submit_failure=False)
++
++    def test_drain_terminates_for_completed_baseexception_and_cancelled_real_futures(self):
++        completed = threading.Event()
++        release, started = threading.Event(), threading.Event()
++        def failed():
++            raise KeyboardInterrupt("worker failed")
++        def blocking():
++            started.set()
++            if not release.wait(2):
++                raise AssertionError("test release timed out")
++        with ThreadPoolExecutor(1) as workers:
++            failed_future = workers.submit(failed)
++            failed_future.add_done_callback(lambda _: completed.set())
++            self.assertTrue(completed.wait(1))
++            with self.assertRaises(KeyboardInterrupt):
++                failed_future.result()
++            blocking_future = workers.submit(blocking)
++            try:
++                self.assertTrue(started.wait(1))
++                cancelled = workers.submit(lambda: None)
++                self.assertTrue(cancelled.cancel())
++                expert_pool.drain_futures([failed_future, cancelled])
++                self.assertTrue(failed_future.done())
++                self.assertTrue(cancelled.cancelled())
++            finally:
++                release.set()
++                blocking_future.result()
++
++    def test_partial_submit_failure_drains_running_and_queued_reads(self):
++        started, release, queued_done = threading.Event(), threading.Event(), threading.Event()
++        def blocking(*_):
++            started.set()
++            if not release.wait(2):
++                raise AssertionError("test worker release timed out")
++        def queued(*_):
++            queued_done.set()
++        errors = []
++        with ThreadPoolExecutor(1) as workers:
++            count = [0]
++            def submit(fn, *args):
++                count[0] += 1
++                if count[0] == 3:
++                    raise RuntimeError("submit failed")
++                return workers.submit(blocking if count[0] == 1 else queued)
++            def fill():
++                try:
++                    self.pool.fill(PREFIX, [(0, 0)], submit)
++                except BaseException as error:
++                    errors.append(error)
++            thread = threading.Thread(target=fill)
++            thread.start()
++            self.assertTrue(started.wait(1))
++            thread.join(0.02)
++            still_draining = thread.is_alive()
++            release.set()
++            thread.join(2)
++        self.assertTrue(still_draining, "submit exception escaped before running read drained")
++        self.assertTrue(queued_done.is_set(), "queued task was not drained")
++        self.assertEqual(str(errors[0]), "submit failed")
++
++    def run_pool_failure(self, warm_failure=False, submit_failure=False):
++        old, _ = self.pool.assign(4, [3])
++        started, release, queued_done = threading.Event(), threading.Event(), threading.Event()
++        observed, errors = [], []
++        def read(*_):
++            started.set()
++            if not release.wait(2):
++                raise AssertionError("test release timed out")
++            if not warm_failure:
++                raise OSError("short read")
++        def queued(*_):
++            queued_done.set()
++        # Call the real _pool_pass transaction, fail before Metal execution.
++        owner = SimpleNamespace(layer_id=4, hits=0, misses=0,
++                                gate_proj=SimpleNamespace(group_size=32, cache=SimpleNamespace(
++                                    store=self.pool.store, prefix=PREFIX + ".gate_proj")))
++        with ThreadPoolExecutor(1) as workers:
++            count = [0]
++            def submit(fn, *args):
++                count[0] += 1
++                if submit_failure and count[0] == 3:
++                    raise RuntimeError("submit failed")
++                return workers.submit(read if count[0] == 1 else queued)
++            def warm(_):
++                self.assertTrue(started.wait(1))
++                raise RuntimeError("warm failed")
++            def execute():
++                try:
++                    expert_cache.StreamingSwitchGLU._pool_pass(
++                        owner, None, [3, 0, 1], None, None, None, None, None)
++                except BaseException as error:
++                    errors.append(error)
++            native = self.pool.invalidate
++            def invalidate(layer, misses):
++                observed.append((release.is_set(), queued_done.is_set()))
++                native(layer, misses)
++            with mock.patch.object(expert_pool, "for_store", return_value=self.pool), \
++                    mock.patch.object(expert_cache, "_submit_read", side_effect=submit), \
++                    mock.patch.object(expert_cache, "_KEEPWARM", [warm_failure]), \
++                    mock.patch.object(expert_cache, "_keep_gpu_warm_until", side_effect=warm), \
++                    mock.patch.object(self.pool, "invalidate", side_effect=invalidate):
++                thread = threading.Thread(target=execute)
++                thread.start()
++                self.assertTrue(started.wait(1))
++                thread.join(0.02)
++                still_draining = thread.is_alive()
++                release.set()
++                thread.join(2)
++        self.assertTrue(still_draining)
++        self.assertFalse(thread.is_alive())
++        self.assertEqual(observed, [(True, True)])
++        self.assertTrue(errors)
++        self.assertEqual(self.pool._slot_of.get((4, 3)), old[3])
++        self.assertNotIn((4, 0), self.pool._slot_of)
++        self.assertNotIn((4, 1), self.pool._slot_of)
++        self.assertEqual(len(self.pool._free), 15)
++        self.assertEqual(len(set(self.pool._free)), 15)
++
++    def test_future_failure_drains_before_invalidating_all_new_slots(self):
++        self.run_pool_failure()
++
++    def test_keepwarm_failure_drains_before_invalidating_all_new_slots(self):
++        self.run_pool_failure(warm_failure=True)
++
++    def test_submit_failure_drains_before_invalidating_all_new_slots(self):
++        self.run_pool_failure(submit_failure=True)
++
++
++if __name__ == "__main__":
++    unittest.main()

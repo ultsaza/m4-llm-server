@@ -1,0 +1,1355 @@
+diff --git a/macqwen/compaction.py b/macqwen/compaction.py
+new file mode 100644
+index 0000000..d3c010c
+--- /dev/null
++++ b/macqwen/compaction.py
+@@ -0,0 +1,121 @@
++"""Encrypted, stateless continuation notes for the Codex v2 protocol."""
++from __future__ import annotations
++
++import base64
++import hashlib
++import json
++
++
++class CompactionCodec:
++    MAX_TOKEN_BYTES = 128 * 1024
++    MAX_NOTE_BYTES = 64 * 1024
++
++    def __init__(self, secret: str, model: str):
++        from cryptography.fernet import Fernet
++        from cryptography.hazmat.primitives import hashes
++        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
++
++        key = HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
++                   info=b"macqwen-continuation-v1").derive(secret.encode())
++        self.fernet = Fernet(base64.urlsafe_b64encode(key))
++        self.model = model
++
++    def seal(self, summary: str, users: list[str]) -> str:
++        value = {"version": 1, "model": self.model, "summary": summary,
++                 "users": users, "covered": sorted({fingerprint(text) for text in users})}
++        self._validate(value)
++        wire = dict(value, covered=base64.b64encode(
++            b"".join(bytes.fromhex(item) for item in value["covered"])).decode())
++        raw = json.dumps(wire, ensure_ascii=False, separators=(",", ":")).encode()
++        if len(raw) > self.MAX_NOTE_BYTES:
++            raise ValueError("compaction note exceeds its size limit")
++        return self.fernet.encrypt(raw).decode("ascii")
++
++    def open(self, token: str) -> dict:
++        from cryptography.fernet import InvalidToken
++
++        if not isinstance(token, str) or len(token) > self.MAX_TOKEN_BYTES:
++            raise ValueError("invalid compaction packet")
++        try:
++            raw = self.fernet.decrypt(token.encode("ascii"))
++            if len(raw) > self.MAX_NOTE_BYTES:
++                raise ValueError("invalid compaction packet")
++            value = json.loads(raw)
++            if not isinstance(value, dict) or not isinstance(value.get("covered"), str):
++                raise ValueError("invalid compaction packet")
++            hashes_raw = base64.b64decode(value["covered"], validate=True)
++            if len(hashes_raw) % 32:
++                raise ValueError("invalid compaction packet")
++            value["covered"] = [hashes_raw[i:i+32].hex() for i in range(0, len(hashes_raw), 32)]
++            self._validate(value)
++        except (InvalidToken, ValueError, TypeError, UnicodeError, RecursionError):
++            raise ValueError("invalid compaction packet") from None
++        return value
++
++    def _validate(self, value):
++        if (not isinstance(value, dict)
++                or set(value) != {"version", "model", "summary", "covered", "users"}
++                or type(value["version"]) is not int or value["version"] != 1
++                or value["model"] != self.model
++                or not isinstance(value["summary"], str) or not value["summary"].strip()
++                or len(value["summary"].encode()) > 16 * 1024
++                or not isinstance(value["covered"], list) or len(value["covered"]) > 512
++                or any(not isinstance(item, str) or len(item) != 64
++                       or any(c not in "0123456789abcdef" for c in item)
++                       for item in value["covered"])
++                or not isinstance(value["users"], list)
++                or any(not isinstance(text, str) for text in value["users"])
++                or sum(len(text.encode()) for text in value["users"]) > 6000
++                or value["covered"] != sorted({fingerprint(text) for text in value["users"]})):
++            raise ValueError("invalid compaction packet")
++
++
++def fingerprint(text: str) -> str:
++    return hashlib.sha256(text.encode()).hexdigest()
++
++
++def excerpt(text: str, limit: int) -> str:
++    encoded = text.encode()
++    if len(encoded) <= limit:
++        return text
++    half = limit // 2
++    return (encoded[:half].decode("utf-8", "ignore") + "\n[excerpt; middle omitted]\n"
++            + encoded[-half:].decode("utf-8", "ignore"))
++
++
++def continuation_note(messages, result, prior_note=None, new_users=()):
++    """Keep task/result literals even if the model's prose is degenerate."""
++    candidate = result.text.strip()
++    use_model = (len(candidate) >= 64 and result.stats.finish != "length"
++                 and not result.tool_calls and not result.protocol_error
++                 and not any(marker in candidate.lower() for marker in
++                             ("<tool", "<|tool", "<function", "<name>", "<arguments>")))
++    parts = ["Continuation notes. Use the recorded tool outcomes to distinguish completed work "
++             "from failed attempts. Do not repeat successful actions; continue the pending user task."]
++    if use_model:
++        parts.append(excerpt(candidate, 2400))
++    if prior_note:
++        parts.append("Previous state:\n" + excerpt(prior_note["summary"], 2400))
++    # Never mark a user request covered just because a model summarized it.
++    # Store complete literals in a bounded ledger. Anything that does not fit
++    # remains an ordinary user message on subsequent replay.
++    retained = list(prior_note["users"]) if prior_note else []
++    size = sum(len(text.encode()) for text in retained)
++    for text in new_users:
++        if text not in retained and size + len(text.encode()) <= 6000:
++            retained.append(text)
++            size += len(text.encode())
++    recent = [m for m in messages if m["role"] == "tool"][-2:]
++    if recent:
++        calls = {call["id"]: call["function"] for message in messages
++                 for call in message.get("tool_calls", [])}
++        records = []
++        for message in recent:
++            function = calls.get(message.get("tool_call_id"))
++            attempt = ("Recorded tool attempt (already returned):\n" +
++                       excerpt(json.dumps(function, ensure_ascii=False), 800) + "\n"
++                       if function else "")
++            records.append(attempt + "Observed result:\n" + excerpt(message["content"], 1200))
++        parts.append("Recent tool results (literal excerpts, including failures):\n" +
++                     "\n\n".join(records))
++    return "\n\n".join(parts), "model+extracts" if use_model else "extractive", retained
+diff --git a/macqwen/server.py b/macqwen/server.py
+index ddc1afb..0dafff6 100644
+--- a/macqwen/server.py
++++ b/macqwen/server.py
+@@ -2,10 +2,20 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
++from contextlib import nullcontext
++from concurrent.futures import ThreadPoolExecutor
+ from http.server import BaseHTTPRequestHandler, HTTPServer
+ import hmac
++import inspect
+ import json
++import math
++import os
+ import re
++import select
++import socket
++from socketserver import ThreadingMixIn
++import threading
++import sys
+ import time
+ import uuid
+ from urllib.parse import urlsplit
+@@ -13,6 +23,7 @@ from urllib.parse import urlsplit
+ from macqwen.text import (
+     CompletedTextBuffer,
+     ThinkingStreamFilter,
++    ToolCallStreamFilter,
+     build_user_encoder,
+ )
+ from macqwen.tools import ToolCallValidationError, coerce_scalar
+@@ -35,9 +46,10 @@ XML_PARAMETER = re.compile(
+ 
+ 
+ class RequestError(ValueError):
+-    def __init__(self, message: str, status: int = 400):
++    def __init__(self, message: str, status: int = 400, code=None):
+         super().__init__(message)
+         self.status = status
++        self.code = code
+ 
+ 
+ @dataclass
+@@ -45,6 +57,7 @@ class Completion:
+     text: str
+     tool_calls: list[dict]
+     stats: object
++    protocol_error: str | None = None
+ 
+ 
+ def _text_content(content) -> str:
+@@ -77,6 +90,7 @@ def _openai_tools(tools) -> list[dict]:
+                     "name": name,
+                     "description": tool.get("description", ""),
+                     "parameters": tool.get("input_schema", tool.get("parameters", {})),
++                    **({"strict": tool["strict"]} if "strict" in tool else {}),
+                 },
+             })
+     return result
+@@ -142,53 +156,184 @@ def _anthropic_messages(payload: dict) -> list[dict]:
+     return _normalize_messages(messages)
+ 
+ 
++def _responses_text(content) -> str:
++    if isinstance(content, str):
++        return content
++    if not isinstance(content, list) or not content:
++        raise RequestError("message content must be non-empty text")
++    parts = []
++    for block in content:
++        if (not isinstance(block, dict)
++                or block.get("type") not in ("text", "input_text", "output_text")
++                or not isinstance(block.get("text"), str)):
++            raise RequestError("this server accepts text content only")
++        parts.append(block["text"])
++    return "".join(parts)
++
++
++def _response_identifier(value, label, *, name=False):
++    pattern = r"[A-Za-z0-9_.-]+" if name else r"[A-Za-z0-9_-]+"
++    if not isinstance(value, str) or not re.fullmatch(pattern, value):
++        raise RequestError(f"{label} must be a valid non-empty string")
++    return value
++
++
++def _response_function_name(name, namespace=None):
++    name = _response_identifier(name, "function name", name=True)
++    if namespace is None:
++        return name
++    namespace = _response_identifier(namespace, "function namespace", name=True)
++    return f"{namespace}.{name}"
++
++
++def _response_tools(tools):
++    """Render namespace functions for Qwen while retaining their wire identity."""
++    if not isinstance(tools, list):
++        raise RequestError("tools must be a list of functions or namespaces")
++    normalized, wire_names = [], {}
++    for definition in tools:
++        if not isinstance(definition, dict):
++            raise RequestError("tools must contain function definitions or namespaces only")
++        namespace = None
++        if definition.get("type") == "namespace":
++            namespace = _response_identifier(definition.get("name"), "function namespace", name=True)
++            if not isinstance(definition.get("description", ""), str):
++                raise RequestError("namespace description must be text")
++            members = definition.get("tools")
++            if not isinstance(members, list) or not members:
++                raise RequestError("namespace tools must be a non-empty list of functions")
++        else:
++            members = [definition]
++        for member in members:
++            if not isinstance(member, dict) or member.get("type") != "function":
++                raise RequestError("tools must contain function definitions only inside namespaces")
++            if "function" in member and not isinstance(member["function"], dict):
++                raise RequestError("function definition must be an object")
++            converted = _openai_tools([member])
++            if len(converted) != 1:
++                raise RequestError("function definitions require a valid name")
++            function = dict(converted[0]["function"])
++            name = _response_identifier(function.get("name"), "function name", name=True)
++            qualified = _response_function_name(name, namespace)
++            if qualified in wire_names:
++                raise RequestError("duplicate or ambiguous function name")
++            wire_names[qualified] = {"name": name}
++            if namespace is not None:
++                wire_names[qualified]["namespace"] = namespace
++            function["name"] = qualified
++            normalized.append(dict(converted[0], function=function))
++    return normalized, wire_names
++
++
++def _response_call_item(call, wire_names):
++    return {"type": "function_call", "id": f"fc_{uuid.uuid4().hex}",
++            "call_id": call["id"], **wire_names.get(call["name"], {"name": call["name"]}),
++            "arguments": call["arguments"], "status": "completed"}
++
++
+ def _responses_messages(payload: dict) -> list[dict]:
+     messages = []
++    system_parts = []
+     instructions = payload.get("instructions")
++    if "instructions" in payload and not isinstance(instructions, str):
++        raise RequestError("instructions must be text")
+     if instructions:
+-        messages.append({"role": "system", "content": str(instructions)})
+-    source = payload.get("input", "")
++        if not instructions.strip():
++            raise RequestError("instructions must contain non-empty text")
++        system_parts.append(instructions)
++    source = payload.get("input", [])
+     if isinstance(source, str):
+-        messages.append({"role": "user", "content": source})
+-    elif isinstance(source, list):
+-        for item in source:
+-            if not isinstance(item, dict):
+-                continue
+-            kind = item.get("type", "message")
+-            if kind == "message":
+-                messages.append({
+-                    "role": item.get("role", "user"),
+-                    "content": _text_content(item.get("content", "")),
+-                })
+-            elif kind == "function_call_output":
+-                messages.append({
+-                    "role": "tool",
+-                    "tool_call_id": item.get("call_id", ""),
+-                    "content": str(item.get("output", "")),
+-                })
+-            elif kind == "function_call":
+-                messages.append({
+-                    "role": "assistant",
+-                    "content": "",
+-                    "tool_calls": [{
+-                        "id": item.get("call_id", item.get("id", "")),
+-                        "type": "function",
+-                        "function": {
+-                            "name": item.get("name", ""),
+-                            "arguments": item.get("arguments", "{}"),
+-                        },
+-                    }],
+-                })
++        source = [{"type": "message", "role": "user", "content": source}]
++    if not isinstance(source, list):
++        raise RequestError("input must be text or a list of items")
++    calls, completed = set(), set()
++    for item in source:
++        if not isinstance(item, dict):
++            raise RequestError("each input item must be an object")
++        kind = item.get("type", "message")
++        if kind == "message":
++            role = item.get("role")
++            if role not in ("system", "developer", "user", "assistant"):
++                raise RequestError("unsupported input message role")
++            content = _responses_text(item.get("content"))
++            if not content.strip():
++                raise RequestError("messages must contain non-empty text")
++            if role in ("system", "developer"):
++                system_parts.append(content)
++            else:
++                messages.append({"role": role, "content": content})
++        elif kind == "function_call":
++            if "id" in item:
++                _response_identifier(item["id"], "function item id")
++            call_id = _response_identifier(item.get("call_id"), "call_id")
++            name = _response_function_name(item.get("name"), item.get("namespace"))
++            if call_id in calls:
++                raise RequestError("duplicate function call_id")
++            arguments = item.get("arguments")
++            try:
++                parsed = json.loads(arguments, parse_constant=_invalid_json_constant) if isinstance(arguments, str) else None
++            except (ValueError, RecursionError):
++                parsed = None
++            if not isinstance(parsed, dict):
++                raise RequestError("function arguments must encode a JSON object")
++            calls.add(call_id)
++            messages.append({"role": "assistant", "content": "", "tool_calls": [{
++                "id": call_id, "type": "function",
++                "function": {"name": name, "arguments": arguments}}]})
++        elif kind == "function_call_output":
++            call_id = _response_identifier(item.get("call_id"), "call_id")
++            if call_id not in calls or call_id in completed:
++                raise RequestError("function output must match one preceding call")
++            output = item.get("output")
++            if isinstance(output, list):
++                output = _responses_text(output)
++            if not isinstance(output, str):
++                raise RequestError("function output must be text")
++            completed.add(call_id)
++            messages.append({"role": "tool", "tool_call_id": call_id,
++                             "content": output})
++        else:
++            raise RequestError(f"unsupported input item type: {kind}")
++    if calls != completed:
++        raise RequestError("each replayed function call requires a matching output")
++    if system_parts:
++        # The pinned Qwen template permits system content only at index zero.
++        messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
+     return _normalize_messages(messages)
+ 
+ 
++def _invalid_json_constant(value):
++    raise ValueError(f"invalid JSON constant: {value}")
++
++
++def _validate_function_schema(schema, depth=0):
++    if depth > 64:
++        raise RequestError("function schema nesting is too deep")
++    if not isinstance(schema, dict):
++        raise RequestError("function parameters must be a schema object")
++    properties = schema.get("properties", {})
++    if not isinstance(properties, dict):
++        raise RequestError("schema properties must be an object")
++    for name, value in properties.items():
++        if not isinstance(name, str):
++            raise RequestError("schema property names must be strings")
++        _validate_function_schema(value, depth + 1)
++    if "items" in schema:
++        _validate_function_schema(schema["items"], depth + 1)
++    if "required" in schema and (not isinstance(schema["required"], list)
++            or any(not isinstance(name, str) for name in schema["required"])):
++        raise RequestError("schema required must be a list of strings")
++
++
+ def _coerce_argument(value: str, kind: str | None, *, tool="", key="parameter"):
+-    # One shared rule: the XML parser here and parse_tool_calls in
+-    # macqwen.tools both run coerce_scalar, which reverses transport
+-    # escaping exactly once. String payloads keep their bytes; only
+-    # typed scalar conversion normalizes whitespace. Bad typed values
+-    # raise ToolCallValidationError for the caller to report.
+-    return coerce_scalar(value, kind, tool=tool, key=key)
++    # Keep the shared validation/unescaping rule. Codex advertises integer
++    # token budgets as schema "number", but its tool rejects JSON floats.
++    # Preserve a literal integer's exact value and representation on this
++    # XML-to-JSON boundary; JSON call/replay arguments remain untouched.
++    parsed = coerce_scalar(value, kind, tool=tool, key=key)
++    if kind == "number" and re.fullmatch(r"[+-]?[0-9]+", value.strip()):
++        return int(value.strip(), 10)
++    return parsed
+ 
+ 
+ def _parse_tool_calls(text: str, tools=None) -> tuple[str, list[dict]]:
+@@ -243,6 +388,22 @@ def _parse_tool_calls(text: str, tools=None) -> tuple[str, list[dict]]:
+     return clean.strip(), calls
+ 
+ 
++def _tool_protocol_error(raw_text, text, calls):
++    """Retain parse losses for Responses without changing Chat tolerance."""
++    blocks = list(TOOL_CALL.finditer(raw_text))
++    expected = len(blocks)
++    if not blocks and "<tool_call>" in raw_text:
++        tail = raw_text.rsplit("<tool_call>", 1)[1]
++        if "</function>" in tail:
++            expected = 1  # Preserve the existing native XML fallback.
++    if len(calls) != expected:
++        return "model emitted malformed tool protocol"
++    if ("<tool_call>" in text
++            or ThinkingStreamFilter._partial_marker(text, ToolCallStreamFilter.MARKER)):
++        return "model emitted incomplete tool protocol"
++    return None
++
++
+ def _model_tokenizer(backend):
+     tokenizer = getattr(backend, "tokenizer", None)
+     if tokenizer is None:
+@@ -428,12 +589,12 @@ def model_card(service) -> dict:
+         "slug": slug,
+         "display_name": caps["display_name"],
+         "description": "Local low-memory Qwen runtime",
+-        "default_reasoning_level": "medium",
++        "default_reasoning_level": "none",
+         "supported_reasoning_levels": [
+-            {"effort": "low", "description": "Low reasoning effort"},
+-            {"effort": "medium", "description": "Medium reasoning effort"},
+-            {"effort": "high", "description": "High reasoning effort"},
++            {"effort": "none", "description": "Reasoning disabled"},
+         ],
++        "supports_reasoning_summaries": False,
++        "input_modalities": ["text"],
+         "shell_type": "shell_command",
+         "visibility": "list",
+         "minimal_client_version": [0, 0, 0],
+@@ -468,6 +629,8 @@ class ModelService:
+         self.model = f"macqwen-{session.preferences['model']}"
+         self.reused = 0
+         self.rebuilt = 0
++        self.context_limit = None
++        self.request_prompt_tokens = 0
+ 
+     @staticmethod
+     def _substitute_slots(normalized, tokenizer):
+@@ -536,12 +699,21 @@ class ModelService:
+         encode = getattr(backend, "encode", None)
+         common_prefix = getattr(backend, "common_prefix", None)
+         if encode is None or common_prefix is None:
++            if self.context_limit is not None:
++                raise RequestError("backend cannot count the complete prompt", 500)
+             session.reset()
+             backend.append_text(rendered)
+             self.rebuilt += 1
+             return False
+         if ids is None:
+             ids = encode(rendered)
++        if self.context_limit is not None and len(ids) + self.output_budget > self.context_limit:
++            raise RequestError(
++                f"prompt ({len(ids)}) plus requested output ({self.output_budget}) "
++                f"exceeds the {self.context_limit}-token context limit",
++                code="context_length_exceeded"
++            )
++        self.request_prompt_tokens = len(ids)
+         if getattr(backend, "_replay_needed", False):
+             # The transcript may still be a prefix, but the live cache is
+             # deliberately invalid. Reusing it would make a tool result
+@@ -562,9 +734,11 @@ class ModelService:
+         self.rebuilt += 1
+         return False
+ 
+-    def complete(self, messages, tools, max_tokens, on_text=None) -> Completion:
++    def complete(self, messages, tools, max_tokens, on_text=None, *,
++                 should_cancel=None, on_prefill_progress=None) -> Completion:
+         session = self.session
+         backend = session.backend
++        self.output_budget = max_tokens
+         try:
+             normalized = _normalize_messages(messages)
+             system_index = next(
+@@ -611,44 +785,115 @@ class ModelService:
+                 session.preferences["thinking_enabled"], False
+             )
+             words = CompletedTextBuffer()
+-            hold = bool(tools)
++            hide_tools = bool(tools) or getattr(on_text, "hide_tool_markup", False)
++            tool_filter = ToolCallStreamFilter() if hide_tools else None
++            emitted = []
++            trailing = ""
++
++            def emit_visible(piece):
++                nonlocal trailing
++                if not emitted:
++                    piece = piece.lstrip()
++                piece = trailing + piece
++                stripped = piece.rstrip()
++                trailing = piece[len(stripped):]
++                if stripped and on_text is not None:
++                    emitted.append(stripped)
++                    on_text(stripped)
+ 
+             def streamed(piece: str) -> None:
+                 visible = thinking.feed(piece)
++                if tool_filter is not None:
++                    visible = tool_filter.feed(visible)
+                 for complete in words.feed(visible):
+-                    if on_text is not None:
+-                        on_text(None if hold else complete)
+-
+-            text, stats = backend.generate(
+-                max_tokens=max_tokens,
+-                out=streamed if on_text is not None else None,
+-            )
++                    if tool_filter is not None:
++                        emit_visible(complete)
++                    elif on_text is not None:
++                        on_text(complete)
++
++            generate_args = dict(max_tokens=max_tokens,
++                                 out=streamed if on_text is not None else None)
++            parameters = inspect.signature(backend.generate).parameters
++            for name, callback in (("should_cancel", should_cancel),
++                                   ("on_prefill_progress", on_prefill_progress)):
++                if callback is not None:
++                    if name not in parameters:
++                        raise RequestError(f"backend lacks required {name} hook", 500)
++                    generate_args[name] = callback
++            text, stats = backend.generate(**generate_args)
+             if on_text is not None:
+                 tail = thinking.finish()
++                if tool_filter is not None:
++                    tail = tool_filter.feed(tail)
++                    if getattr(on_text, "hide_tool_markup", False) and tool_filter.pending:
++                        raise RequestError("model emitted incomplete tool protocol", 500)
++                    tail += tool_filter.finish()
+                 for complete in words.feed(tail) + words.finish():
+-                    on_text(None if hold else complete)
++                    if tool_filter is not None:
++                        emit_visible(complete)
++                    else:
++                        on_text(complete)
+ 
+             final_filter = ThinkingStreamFilter(
+                 session.preferences["thinking_enabled"], False
+             )
+             visible = final_filter.feed(text) + final_filter.finish()
++            raw_visible = visible
+             visible, calls = _parse_tool_calls(visible, tools)
+-            if hold and on_text is not None and visible:
+-                final_words = CompletedTextBuffer()
+-                for complete in final_words.feed(visible) + final_words.finish():
+-                    on_text(complete)
+-            return Completion(visible, calls, stats)
++            protocol_error = _tool_protocol_error(raw_visible, visible, calls)
++            if getattr(on_text, "hide_tool_markup", False) and protocol_error:
++                raise RequestError(protocol_error, 500)
++            if hide_tools and "<tool_call>" in visible:
++                raise RequestError("model emitted incomplete or invalid tool protocol")
++            if tool_filter is not None and on_text is not None:
++                # The bounded tag filter hides the protocol tail. Release any
++                # final visible suffix only after the complete parse succeeds.
++                prefix = "".join(emitted)
++                if visible.startswith(prefix) and len(visible) > len(prefix):
++                    on_text(visible[len(prefix):])
++            return Completion(visible, calls, stats, protocol_error)
+         except BaseException:
+             session.reset()
+             raise
+ 
+ 
+-class MacqwenHTTPServer(HTTPServer):
+-    def __init__(self, address, service, api_key=None, allowed_origins=()):
++class MacqwenHTTPServer(ThreadingMixIn, HTTPServer):
++    daemon_threads = True
++
++    def __init__(self, address, service, api_key=None, allowed_origins=(), *,
++                 context_limit=4096, compaction_enabled=False):
++        if type(context_limit) is not int or not 1024 <= context_limit <= 262144:
++            raise ValueError("context_limit must be an integer between 1024 and 262144")
++        if type(compaction_enabled) is not bool:
++            raise ValueError("compaction_enabled must be a boolean")
++        self.compaction_codec = None
++        if compaction_enabled:
++            if not api_key:
++                raise ValueError("remote compaction requires an API credential")
++            from macqwen.compaction import CompactionCodec
++            self.compaction_codec = CompactionCodec(api_key, service.model)
+         super().__init__(address, MacqwenHandler)
+         self.service = service
+         self.api_key = api_key
+         self.allowed_origins = tuple(allowed_origins)
++        self.inference_lock = threading.Lock()
++        self.model_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="macqwen-http-model")
++        self.context_limit = context_limit
++        self.default_output_tokens = 512
++        self.max_output_tokens = 1024
++        self.request_timeout = 1200
++        self.heartbeat_interval = 10
++        self.last_request = None
++        if isinstance(service, ModelService):
++            service.context_limit = self.context_limit
++
++    def server_close(self):
++        super().server_close()
++        try:
++            if isinstance(self.service, ModelService):
++                self.model_executor.submit(self.service.session.reset).result()
++        finally:
++            self.model_executor.shutdown(wait=True)
+ 
+ 
+ class MacqwenHandler(BaseHTTPRequestHandler):
+@@ -717,7 +962,10 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+         self.wfile.write(body)
+ 
+     def _error(self, message, status=400):
+-        self._json({"error": {"message": str(message), "type": "invalid_request_error"}}, status)
++        error = {"message": str(message), "type": "invalid_request_error"}
++        if getattr(message, "code", None):
++            error["code"] = message.code
++        self._json({"error": error}, status)
+ 
+     def _payload(self) -> dict:
+         try:
+@@ -727,30 +975,54 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+         if length < 1 or length > MAX_BODY:
+             raise RequestError("request body size is invalid", 413)
+         try:
+-            value = json.loads(self.rfile.read(length))
+-        except (UnicodeDecodeError, ValueError) as exc:
++            value = json.loads(self.rfile.read(length), parse_constant=_invalid_json_constant)
++        except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+             raise RequestError("request body must contain JSON") from exc
+         if not isinstance(value, dict):
+             raise RequestError("request body must be an object")
+         return value
+ 
+     def _sse_start(self):
++        self._sse_lock = threading.Lock()
++        self._heartbeat_stop = threading.Event()
+         self._headers(content_type="text/event-stream")
+         self.send_header("Cache-Control", "no-cache")
+         self.send_header("Connection", "close")
+         self.end_headers()
+         self._sse_open = True
++        interval = getattr(self.server, "heartbeat_interval", None)
++        if interval:
++            def keepalive():
++                while not self._heartbeat_stop.wait(interval):
++                    try:
++                        self._heartbeat()
++                    except (OSError, ValueError):
++                        self._client_gone = True
++                        break
++            self._heartbeat_thread = threading.Thread(target=keepalive, daemon=True)
++            self._heartbeat_thread.start()
++
++    def _stop_heartbeats(self):
++        event = getattr(self, "_heartbeat_stop", None)
++        if event is not None:
++            event.set()
++        worker = getattr(self, "_heartbeat_thread", None)
++        if worker is not None:
++            worker.join(timeout=1)
+ 
+     def _sse(self, value, event=None):
+         prefix = f"event: {event}\n" if event else ""
+-        self.wfile.write((prefix + "data: " + json.dumps(value) + "\n\n").encode())
+-        self.wfile.flush()
++        with getattr(self, "_sse_lock", nullcontext()):
++            self.wfile.write((prefix + "data: " + json.dumps(value) + "\n\n").encode())
++            self.wfile.flush()
+ 
+     def _heartbeat(self):
+-        self.wfile.write(b": generating\n\n")
+-        self.wfile.flush()
++        with getattr(self, "_sse_lock", nullcontext()):
++            self.wfile.write(b": generating\n\n")
++            self.wfile.flush()
+ 
+     def _sse_chat_error(self, message):
++        self._stop_heartbeats()
+         try:
+             self._sse({"error": {"message": str(message),
+                                  "type": "server_error"}})
+@@ -791,35 +1063,58 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+             return
+         path = urlsplit(self.path).path
+         if path == "/health":
+-            self._json({"status": "ok", "model": self.server.service.model})
++            self._json({"status": "busy" if self.server.inference_lock.locked() else "ready",
++                        "model": self.server.service.model,
++                        "context_limit": self.server.context_limit,
++                        "cache_reused": self.server.service.reused,
++                        "cache_rebuilt": self.server.service.rebuilt,
++                        "compaction_protocol": "v2" if getattr(self.server, "compaction_codec", None) else "unsupported",
++                        "last_request": self.server.last_request})
+         elif path == "/v1/models":
+             card = model_card(self.server.service)
++            card["context_window"] = getattr(self.server, "context_limit", card["context_window"])
+             self._json({"object": "list", "data": [{
+                 "id": card["slug"],
+                 "object": "model",
+                 "owned_by": "macqwen",
+-            }], "models": [card]})
++            }], "models": [card], "capabilities": {
++                "remote_compaction": "v2" if getattr(self.server, "compaction_codec", None) else "unsupported"}})
+         else:
+             self._error("route not found", 404)
+ 
+     def do_POST(self):
++        self.close_connection = True
++        self.connection.settimeout(15)
+         if self._reject_foreign_origin():
+             return
+         if not self._authorized():
+             self._error("invalid API key", 401)
+             return
+         self._sse_open = False
++        self._client_gone = False
++        acquired = False
+         try:
+             payload = self._payload()
+             path = urlsplit(self.path).path
+-            if path == "/v1/chat/completions":
+-                self._chat(payload)
+-            elif path == "/v1/messages":
+-                self._anthropic(payload)
+-            elif path == "/v1/responses":
+-                self._responses(payload)
+-            else:
++            if path not in ("/v1/chat/completions", "/v1/responses"):
+                 self._error("route not found", 404)
++                return
++            if path == "/v1/responses":
++                payload, sampling = self._validate_responses(payload)
++            else:
++                sampling = self._validate_chat(payload)
++            if not self.server.inference_lock.acquire(blocking=False):
++                self._headers(503)
++                body = json.dumps({"error":{"message":"model is busy", "type":"server_error"}}).encode()
++                self.send_header("Retry-After", "5")
++                self.send_header("Content-Length", str(len(body)))
++                self.end_headers()
++                self.wfile.write(body)
++                return
++            acquired = True
++            self._deadline = time.monotonic() + self.server.request_timeout
++            self.server.model_executor.submit(
++                self._chat_with_sampling, payload, sampling, path).result()
+         except RequestError as exc:
+             if not getattr(self, "_sse_open", False):
+                 try:
+@@ -835,13 +1130,333 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+                 except (BrokenPipeError, ConnectionResetError):
+                     pass
+ 
+-    def _limit(self, payload, default=4096):
++        finally:
++            self._stop_heartbeats()
++            if acquired:
++                self.server.inference_lock.release()
++
++    def _chat_with_sampling(self, payload, sampling, path="/v1/chat/completions"):
++        backend = self.server.service.session.backend
++        previous = backend.sampling
++        backend.sampling = sampling
++        try:
++            if path == "/v1/responses":
++                if payload.get("compaction"):
++                    self._compact_responses(payload)
++                else:
++                    self._responses(payload)
++            else:
++                self._chat(payload)
++        finally:
++            backend.sampling = previous
++
++    def _validate_chat(self, payload):
++        from macqwen.sampling import INSTRUCT, Sampling
++
++        allowed = {"model", "messages", "tools", "max_tokens", "max_completion_tokens",
++                   "stream", "temperature", "top_p", "top_k", "min_p", "presence_penalty"}
++        unknown = set(payload) - allowed
++        if unknown:
++            raise RequestError("unsupported options: " + ", ".join(sorted(unknown)))
++        if "max_tokens" in payload and "max_completion_tokens" in payload:
++            raise RequestError("specify only one output limit")
++        if payload.get("model", self.server.service.model) != self.server.service.model:
++            raise RequestError("requested model is not loaded")
++        if "stream" in payload and not isinstance(payload["stream"], bool):
++            raise RequestError("stream must be a boolean")
++        _normalize_messages(payload.get("messages"))
++        for message in payload["messages"]:
++            content = message.get("content")
++            if content is None and message.get("role") == "assistant" and message.get("tool_calls"):
++                continue
++            if isinstance(content, str):
++                continue
++            if isinstance(content, list) and all(
++                    isinstance(block, dict) and block.get("type") == "text"
++                    and isinstance(block.get("text"), str) for block in content):
++                continue
++            raise RequestError("this server accepts text content only")
++        tools = payload.get("tools", [])
++        if not isinstance(tools, list) or any(
++                not isinstance(tool, dict) or tool.get("type") != "function"
++                or not isinstance(tool.get("function"), dict)
++                or not isinstance(tool["function"].get("name"), str) for tool in tools):
++            raise RequestError("tools must contain function definitions")
++        self._limit(payload)
++        settings = dict(INSTRUCT)
++        bounds = {"temperature": (0, 2), "top_p": (0, 1), "min_p": (0, 1),
++                  "presence_penalty": (-2, 2), "top_k": (0, 1000)}
++        for name, (low, high) in bounds.items():
++            if name not in payload:
++                continue
++            value = payload[name]
++            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
++                raise RequestError(f"{name} must be finite and numeric")
++            if not low <= value <= high or (name == "top_p" and value == 0):
++                raise RequestError(f"{name} is outside its supported range")
++            if name == "top_k" and not isinstance(value, int):
++                raise RequestError("top_k must be an integer")
++            settings[name] = value
++        return Sampling(**settings)
++
++    def _validate_responses(self, payload):
++        allowed = {"model", "input", "instructions", "tools", "tool_choice",
++                   "parallel_tool_calls", "max_output_tokens", "stream",
++                   "temperature", "top_p", "top_k", "min_p", "presence_penalty",
++                   "store", "include", "reasoning", "prompt_cache_key",
++                   "client_metadata", "background", "previous_response_id",
++                   "conversation", "truncation", "text"}
++        unknown = set(payload) - allowed
++        if unknown:
++            raise RequestError("unsupported options: " + ", ".join(sorted(unknown)))
++        if "parallel_tool_calls" in payload and not isinstance(payload["parallel_tool_calls"], bool):
++            raise RequestError("parallel_tool_calls must be a boolean")
++        for name in ("store", "background"):
++            if name in payload and payload[name] is not False:
++                raise RequestError(f"{name} supports false only")
++        for name in ("previous_response_id", "conversation"):
++            if name in payload and payload[name] not in (None, ""):
++                raise RequestError(f"{name} is unsupported; replay the full input")
++        if "truncation" in payload and payload["truncation"] != "disabled":
++            raise RequestError("truncation supports disabled only")
++        if "text" in payload and payload["text"] not in ({}, {"format": {"type": "text"}}):
++            raise RequestError("structured text formats are unsupported")
++        if "prompt_cache_key" in payload and not isinstance(payload["prompt_cache_key"], str):
++            raise RequestError("prompt_cache_key must be a string")
++        if "client_metadata" in payload and not isinstance(payload["client_metadata"], dict):
++            raise RequestError("client_metadata must be an object")
++        include = payload.get("include", [])
++        if not isinstance(include, list) or any(v != "reasoning.encrypted_content" for v in include):
++            raise RequestError("unsupported include value")
++        reasoning = payload.get("reasoning", {})
++        if (not isinstance(reasoning, dict) or set(reasoning) - {"effort", "summary"}
++                or reasoning.get("effort", "none") != "none"
++                or reasoning.get("summary", "none") not in ("auto", "none")):
++            raise RequestError("reasoning is disabled; only none effort is supported")
++        if payload.get("tool_choice", "auto") not in ("auto", "none"):
++            raise RequestError("tool_choice supports auto or none only")
++        normalized_tools, wire_names = _response_tools(payload.get("tools", []))
++        names = set()
++        for tool in normalized_tools:
++            function = tool["function"]
++            name = _response_identifier(function.get("name"), "function name", name=True)
++            if name in names:
++                raise RequestError("duplicate function name")
++            names.add(name)
++            if not isinstance(function.get("description", ""), str):
++                raise RequestError("function description must be text")
++            if "strict" in function and not isinstance(function["strict"], bool):
++                raise RequestError("function strict must be a boolean")
++            schema = function.get("parameters", {})
++            _validate_function_schema(schema)
++            if schema.get("type", "object") != "object":
++                raise RequestError("function parameters must describe an object")
++        messages, compacting, prior_note, new_users = self._prepare_compaction_input(payload)
++        canonical = {"messages": messages,
++                     "tools": normalized_tools if payload.get("tool_choice") != "none" else []}
++        for name in ("model", "stream", "temperature", "top_p", "top_k", "min_p", "presence_penalty"):
++            if name in payload:
++                canonical[name] = payload[name]
++        if "max_output_tokens" in payload:
++            canonical["max_tokens"] = payload["max_output_tokens"]
++        sampling = self._validate_chat(canonical)
++        canonical["response_wire_names"] = wire_names
++        canonical["parallel_tool_calls"] = payload.get("parallel_tool_calls", False)
++        if compacting:
++            canonical["compaction"] = True
++            canonical["prior_note"] = prior_note
++            canonical["new_users"] = new_users
++            from macqwen.sampling import Sampling
++            sampling = Sampling.greedy_settings()
++        return canonical, sampling
++
++    def _prepare_compaction_input(self, payload):
++        raw = payload.get("input")
++        if not isinstance(raw, list):
++            return _responses_messages(payload), False, None, []
++        triggers = [i for i, item in enumerate(raw)
++                    if isinstance(item, dict) and item.get("type") == "compaction_trigger"]
++        compacting = bool(triggers)
++        if compacting and (triggers != [len(raw)-1] or raw[-1] != {"type": "compaction_trigger"}):
++            raise RequestError("compaction_trigger must occur exactly once at the end")
++        source = raw[:-1] if compacting else raw
++        packets = [i for i, item in enumerate(source)
++                   if isinstance(item, dict) and item.get("type") == "compaction"]
++        if not compacting and not packets:
++            return _responses_messages(payload), False, None, []
++        if compacting or packets:
++            if self.server.compaction_codec is None:
++                raise RequestError("remote compaction is unsupported")
++        if len(packets) > 1:
++            raise RequestError("replay at most one current compaction packet")
++        expanded = list(source)
++        previous_covered = set()
++        note = None
++        if packets:
++            index = packets[0]
++            item = source[index]
++            if set(item) - {"type", "id", "encrypted_content"}:
++                raise RequestError("unsupported compaction item fields")
++            if "id" in item:
++                _response_identifier(item["id"], "compaction id")
++            try:
++                note = self.server.compaction_codec.open(item.get("encrypted_content"))
++            except ValueError:
++                raise RequestError("invalid compaction packet") from None
++            previous_covered = set(note["covered"])
++            expanded[index] = {"role": "user", "content": "[Prior conversation notes]\n" +
++                "User requirements retained exactly:\n" + "\n\n".join(note["users"]) +
++                "\n\nCurrent task state (latest):\n" + note["summary"]}
++        # Validate every original text/tool item before omitting covered users;
++        # encryption is not a way to bypass content or call/result validation.
++        _responses_messages(dict(payload, input=expanded))
++        from macqwen.compaction import fingerprint
++        covered = []
++        new_users = []
++        filtered = []
++        for index, item in enumerate(expanded):
++            original = source[index]
++            if (isinstance(original, dict) and original.get("role") == "user"
++                    and original.get("type") in (None, "message")):
++                text = _responses_messages({"input": [original]})[0]["content"]
++                key = fingerprint(text)
++                covered.append(key)
++                if packets and index < packets[0] and key in previous_covered:
++                    continue
++                new_users.append(text)
++            filtered.append(item)
++        if compacting and not source:
++            raise RequestError("compaction requires conversation input")
++        if compacting and len(set(covered)) > 512:
++            raise RequestError("compaction supports at most 512 retained user messages")
++        return _responses_messages(dict(payload, input=filtered)), compacting, note, new_users
++
++    def _should_cancel(self):
++        if time.monotonic() >= self._deadline:
++            raise RequestError("request deadline exceeded", 408)
++        if self._client_gone:
++            return True
++        try:
++            if select.select([self.connection], [], [], 0)[0]:
++                if not self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT):
++                    self._client_gone = True
++        except (OSError, ValueError):
++            self._client_gone = True
++        return self._client_gone
++
++    def _complete(self, messages, tools, max_tokens, on_text=None, on_prefill_progress=None):
++        began = time.monotonic()
++        mx = sys.modules.get("mlx.core")
++        if mx is not None and callable(getattr(mx, "reset_peak_memory", None)):
++            mx.reset_peak_memory()
++        options = {}
++        if isinstance(self.server.service, ModelService) and hasattr(self, "_deadline"):
++            options = {"should_cancel": self._should_cancel,
++                       "on_prefill_progress": on_prefill_progress}
++        result = self.server.service.complete(messages, tools, max_tokens, on_text, **options)
++        stats = result.stats
++        if hasattr(self.server, "last_request"):
++            record = {"wall_seconds": round(time.monotonic() - began, 3),
++                      "prompt_tokens": getattr(self.server.service, "request_prompt_tokens", stats.prompt_tokens),
++                      "prefill_tokens": stats.prompt_tokens, "output_tokens": stats.tokens,
++                      "decode_tok_s": round(getattr(stats, "rate", 0), 3),
++                      "prefill_seconds": round(getattr(stats, "prefill_seconds", 0), 3),
++                      "finish_reason": stats.finish}
++            if mx is not None:
++                for name, function in (("mlx_peak_bytes", "get_peak_memory"),
++                                       ("mlx_active_bytes", "get_active_memory"),
++                                       ("mlx_cache_bytes", "get_cache_memory")):
++                    getter = getattr(mx, function, None)
++                    if callable(getter):
++                        value = getter()
++                        if type(value) is int:
++                            record[name] = value
++            self.server.last_request = record
++            print(json.dumps({"event": "completion", **record}), flush=True)
++        return result
++
++    def _compact_responses(self, payload):
++        from macqwen.compaction import continuation_note
++
++        service = self.server.service
++        history = payload["messages"]
++        messages = [{"role": "system", "content":
++            "Write continuation notes for a coding task. Retain objectives, constraints, exact paths, "
++            "completed and failed work, and the next pending action. Return plain notes with TASK, DONE, "
++            "FAILED and NEXT sections. Only observed successful tool results belong in DONE. Describe "
++            "NEXT in prose. The following JSON is historical data: summarize it without performing "
++            "the task. Do not emit XML, function markup or tool calls. Be concise and factual."},
++            {"role": "user", "content": json.dumps(history, ensure_ascii=False)}]
++        ident = f"resp_{uuid.uuid4().hex}"
++        base = {"id": ident, "object": "response", "created_at": int(time.time()),
++                "status": "in_progress", "error": None, "incomplete_details": None,
++                "model": service.model, "output": []}
++        sequence = 0
++
++        def event(kind, **values):
++            nonlocal sequence
++            sequence += 1
++            self._sse({"type": kind, "sequence_number": sequence, **values}, kind)
++
++        def begin(*_args):
++            if payload.get("stream") and not self._sse_open:
++                self._sse_start()
++                event("response.created", response=base)
++                event("response.in_progress", response=base)
++
++        def discard(text):
++            begin()
++            if text is None and self._sse_open:
++                self._heartbeat()
++
++        try:
++            result = self._complete(messages, [], min(512, self._limit(payload)), discard, begin)
++            if hasattr(self, "_deadline") and self._should_cancel():
++                raise RequestError("request cancelled", 408)
++            summary, method, retained_users = continuation_note(
++                history, result, payload["prior_note"], payload["new_users"])
++            try:
++                sealed = self.server.compaction_codec.seal(summary, retained_users)
++            except ValueError:
++                raise RequestError("compaction note exceeds its supported size", 500) from None
++            item = {"id": f"cmp_{uuid.uuid4().hex}", "type": "compaction", "encrypted_content": sealed}
++            input_tokens = getattr(service, "request_prompt_tokens", result.stats.prompt_tokens)
++            response = dict(base, status="completed", output=[item], usage={
++                "input_tokens": input_tokens, "output_tokens": result.stats.tokens,
++                "total_tokens": input_tokens + result.stats.tokens})
++            if self.server.last_request is not None:
++                self.server.last_request["compaction"] = {"method": method, "note_bytes": len(summary.encode()),
++                                                          "covered_users": len(retained_users)}
++            if payload.get("stream"):
++                begin()
++                event("response.output_item.added", output_index=0, item=dict(item, encrypted_content=""))
++                event("response.output_item.done", output_index=0, item=item)
++                event("response.completed", response=response)
++            else:
++                self._json(response)
++        except (BrokenPipeError, ConnectionResetError):
++            pass
++        except Exception as exc:
++            if self._sse_open:
++                event("response.failed", response=dict(base, status="failed", error={
++                    "message": str(exc), "type": "server_error"}))
++            else:
++                raise
++        finally:
++            self._stop_heartbeats()
++
++    def _limit(self, payload, default=None):
++        if default is None:
++            default = getattr(self.server, "default_output_tokens", 4096)
+         value = payload.get(
+             "max_output_tokens",
+             payload.get("max_completion_tokens", payload.get("max_tokens", default)),
+         )
+         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+             raise RequestError("max_tokens must be a positive integer")
++        maximum = getattr(self.server, "max_output_tokens", None)
++        if maximum is not None and value > maximum:
++            raise RequestError(f"requested output exceeds the {maximum}-token limit")
+         return min(value, capabilities(self.server.service)["context_window"])
+ 
+     def _chat(self, payload):
+@@ -852,7 +1467,6 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+         created = int(time.time())
+         if payload.get("stream"):
+             max_tokens = self._limit(payload)
+-            self._sse_start()
+             try:
+ 
+                 def chunk(delta, finish=None):
+@@ -862,40 +1476,50 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+                         "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                     })
+ 
+-                chunk({"role": "assistant", "content": ""})
++                def begin_stream(*_args):
++                    if not self._sse_open:
++                        self._sse_start()
++                        chunk({"role": "assistant", "content": ""})
+ 
+                 def on_text(text):
++                    begin_stream()
+                     self._heartbeat() if text is None else chunk({"content": text})
+ 
+-                result = service.complete(messages, tools, max_tokens, on_text)
++                result = self._complete(messages, tools, max_tokens, on_text, begin_stream)
++                begin_stream()
+                 for index, call in enumerate(result.tool_calls):
+                     chunk({"tool_calls": [{
+                         "index": index, "id": call["id"], "type": "function",
+                         "function": {"name": call["name"], "arguments": call["arguments"]},
+                     }]})
+                 chunk({}, "tool_calls" if result.tool_calls else result.stats.finish)
++                self._stop_heartbeats()
+                 self.wfile.write(b"data: [DONE]\n\n")
+                 self.wfile.flush()
+             except (BrokenPipeError, ConnectionResetError):
+                 pass
+             except Exception as exc:
++                if not self._sse_open and isinstance(exc, RequestError):
++                    raise
++                begin_stream()
+                 self._sse_chat_error(exc)
+             return
+-        result = service.complete(messages, tools, self._limit(payload))
++        result = self._complete(messages, tools, self._limit(payload))
+         message = {"role": "assistant", "content": result.text or None}
+         if result.tool_calls:
+             message["tool_calls"] = [{
+                 "id": call["id"], "type": "function",
+                 "function": {"name": call["name"], "arguments": call["arguments"]},
+             } for call in result.tool_calls]
++        prompt_tokens = getattr(service, "request_prompt_tokens", result.stats.prompt_tokens)
+         self._json({
+             "id": ident, "object": "chat.completion", "created": created,
+             "model": service.model,
+             "choices": [{"index": 0, "message": message,
+                          "finish_reason": "tool_calls" if result.tool_calls else result.stats.finish}],
+-            "usage": {"prompt_tokens": result.stats.prompt_tokens,
++            "usage": {"prompt_tokens": prompt_tokens,
+                       "completion_tokens": result.stats.tokens,
+-                      "total_tokens": result.stats.prompt_tokens + result.stats.tokens},
++                      "total_tokens": prompt_tokens + result.stats.tokens},
+         })
+ 
+     def _anthropic(self, payload):
+@@ -974,14 +1598,46 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+                       "output_tokens": result.stats.tokens},
+         })
+ 
++    def _validate_response_calls(self, calls, tools, parallel_tool_calls=False):
++        if not parallel_tool_calls and len(calls) > 1:
++            raise RequestError("model emitted parallel calls; only one function call is supported", 500)
++        names = {tool["function"]["name"] for tool in _openai_tools(tools)}
++        ids = set()
++        for call in calls:
++            try:
++                call_id = _response_identifier(call.get("id"), "generated call_id")
++                name = _response_identifier(call.get("name"), "generated function name", name=True)
++                arguments = json.loads(call["arguments"], parse_constant=_invalid_json_constant)
++            except (ValueError, TypeError, KeyError, RecursionError):
++                raise RequestError("model emitted an invalid function call", 500) from None
++            if call_id in ids or name not in names or not isinstance(arguments, dict):
++                raise RequestError("model emitted an unsupported or duplicate function call", 500)
++            ids.add(call_id)
++
++    @staticmethod
++    def _responses_render_messages(messages):
++        """Copy validated replay into the argument shape the Qwen template uses."""
++        rendered = []
++        for message in messages:
++            item = dict(message)
++            if message.get("tool_calls"):
++                item["tool_calls"] = []
++                for call in message["tool_calls"]:
++                    function = dict(call["function"])
++                    function["arguments"] = json.loads(function["arguments"], parse_constant=_invalid_json_constant)
++                    item["tool_calls"].append(dict(call, function=function))
++            rendered.append(item)
++        return rendered
++
+     def _responses(self, payload):
+         service = self.server.service
+-        messages = _responses_messages(payload)
++        messages = self._responses_render_messages(
++            payload.get("messages") or _responses_messages(payload))
+         tools = payload.get("tools") or []
++        wire_names = payload.get("response_wire_names", {})
+         ident = f"resp_{uuid.uuid4().hex}"
+         if payload.get("stream"):
+             max_tokens = self._limit(payload)
+-            self._sse_start()
+             try:
+                 base = {"id": ident, "object": "response", "created_at": int(time.time()),
+                         "status": "in_progress", "error": None,
+@@ -992,12 +1648,16 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+                     sequence[0] += 1
+                     self._sse({"type": kind, "sequence_number": sequence[0], **values}, kind)
+ 
+-                event("response.created", response=base)
+-                event("response.in_progress", response=base)
++                def begin_stream(*_args):
++                    if not self._sse_open:
++                        self._sse_start()
++                        event("response.created", response=base)
++                        event("response.in_progress", response=base)
+                 item_id = f"msg_{uuid.uuid4().hex}"
+                 opened = [False]
+ 
+                 def on_text(text):
++                    begin_stream()
+                     if text is None:
+                         self._heartbeat()
+                         return
+@@ -1012,7 +1672,16 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+                     event("response.output_text.delta", item_id=item_id,
+                           output_index=0, content_index=0, delta=text)
+ 
+-                result = service.complete(messages, tools, max_tokens, on_text)
++                # Request protocol filtering through the existing callback
++                # boundary, even if an unprompted model call has no schema.
++                on_text.hide_tool_markup = True
++                result = self._complete(messages, tools, max_tokens, on_text, begin_stream)
++                if getattr(result, "protocol_error", None):
++                    raise RequestError(result.protocol_error, 500)
++                self._validate_response_calls(result.tool_calls, tools, payload.get("parallel_tool_calls", False))
++                if hasattr(self, "_deadline") and self._should_cancel():
++                    raise RequestError("request cancelled", 408)
++                begin_stream()
+                 output = []
+                 if result.text:
+                     message = {"id": item_id, "type": "message", "status": "completed",
+@@ -1025,9 +1694,7 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+                           content_index=0, part=message["content"][0])
+                     event("response.output_item.done", output_index=0, item=message)
+                 for index, call in enumerate(result.tool_calls, start=len(output)):
+-                    item = {"type": "function_call", "id": f"fc_{uuid.uuid4().hex}",
+-                            "call_id": call["id"], "name": call["name"],
+-                            "arguments": call["arguments"], "status": "completed"}
++                    item = _response_call_item(call, wire_names)
+                     output.append(item)
+                     pending = dict(item, arguments="", status="in_progress")
+                     event("response.output_item.added", output_index=index, item=pending)
+@@ -1037,16 +1704,28 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+                           output_index=index, arguments=call["arguments"])
+                     event("response.output_item.done", output_index=index, item=item)
+                 completed = dict(base, status="completed", output=output,
+-                                 usage={"input_tokens": result.stats.prompt_tokens,
++                                 usage={"input_tokens": getattr(service, "request_prompt_tokens", result.stats.prompt_tokens),
+                                         "output_tokens": result.stats.tokens,
+-                                        "total_tokens": result.stats.prompt_tokens + result.stats.tokens})
++                                        "total_tokens": getattr(service, "request_prompt_tokens", result.stats.prompt_tokens) + result.stats.tokens})
+                 event("response.completed", response=completed)
+             except (BrokenPipeError, ConnectionResetError):
+                 pass
+             except Exception as exc:
+-                self._sse_responses_error(exc, ident)
++                if not self._sse_open and isinstance(exc, RequestError):
++                    raise
++                begin_stream()
++                self._stop_heartbeats()
++                error = {"message": str(exc), "type": "server_error"}
++                if getattr(exc, "code", None):
++                    error["code"] = exc.code
++                event("response.failed", response=dict(base, status="failed", error=error))
+             return
+-        result = service.complete(messages, tools, self._limit(payload))
++        result = self._complete(messages, tools, self._limit(payload))
++        if getattr(result, "protocol_error", None):
++            raise RequestError(result.protocol_error, 500)
++        self._validate_response_calls(result.tool_calls, tools, payload.get("parallel_tool_calls", False))
++        if hasattr(self, "_deadline") and self._should_cancel():
++            raise RequestError("request cancelled", 408)
+         output = []
+         if result.text:
+             output.append({"id": f"msg_{uuid.uuid4().hex}", "type": "message",
+@@ -1054,33 +1733,35 @@ class MacqwenHandler(BaseHTTPRequestHandler):
+                            "content": [{"type": "output_text", "text": result.text,
+                                         "annotations": []}]})
+         for call in result.tool_calls:
+-            output.append({"type": "function_call", "id": f"fc_{uuid.uuid4().hex}",
+-                           "call_id": call["id"], "name": call["name"],
+-                           "arguments": call["arguments"], "status": "completed"})
++            output.append(_response_call_item(call, wire_names))
+         self._json({
+             "id": ident, "object": "response", "created_at": int(time.time()),
+             "status": "completed", "model": service.model, "output": output,
+-            "usage": {"input_tokens": result.stats.prompt_tokens,
++            "usage": {"input_tokens": getattr(service, "request_prompt_tokens", result.stats.prompt_tokens),
+                       "output_tokens": result.stats.tokens,
+-                      "total_tokens": result.stats.prompt_tokens + result.stats.tokens},
++                      "total_tokens": getattr(service, "request_prompt_tokens", result.stats.prompt_tokens) + result.stats.tokens},
+         })
+ 
+ 
+ def serve(session, host: str, port: int, api_key: str | None = None,
+           allowed_origins=()) -> None:
+     """Reset the model when the server starts and when it stops."""
+-    session.reset()
++    try:
++        context_limit = int(os.environ.get("MACQWEN_SERVER_CONTEXT_LIMIT", "4096"))
++    except ValueError:
++        raise ValueError("invalid MACQWEN_SERVER_CONTEXT_LIMIT") from None
+     server = MacqwenHTTPServer(
+-        (host, port), ModelService(session), api_key, allowed_origins)
++        (host, port), ModelService(session), api_key, allowed_origins,
++        context_limit=context_limit,
++        compaction_enabled=os.environ.get("MACQWEN_REMOTE_COMPACTION") == "1")
++    server.model_executor.submit(session.reset).result()
+     print(f"server ready at http://{host}:{server.server_port}")
+     if allowed_origins:
+         print(f"browser origins allowed: {', '.join(allowed_origins)}")
+-    print("OpenAI: /v1/chat/completions and /v1/responses")
+-    print("Anthropic: /v1/messages")
++    print(f"OpenAI: /v1/chat/completions (text); context {server.context_limit}, output 512/1024")
+     try:
+         server.serve_forever()
+     except KeyboardInterrupt:
+         print("\nserver stopped")
+     finally:
+         server.server_close()
+-        session.reset()
+diff --git a/pyproject.toml b/pyproject.toml
+index 1045866..0b59fd2 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -25,6 +25,7 @@ dependencies = [
+   "numpy==2.5.2",
+   "requests==2.34.2",
+   "huggingface-hub==1.29.0",
++  "cryptography==50.0.2",
+ ]
+ 
+ [project.scripts]
